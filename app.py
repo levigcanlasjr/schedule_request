@@ -91,9 +91,15 @@ def init_db():
         run("ALTER TABLE users ADD COLUMN team TEXT")
     except Exception:
         pass
+    try:  # adds the forced password change flag; existing non-admin users get flagged
+        run("ALTER TABLE users ADD COLUMN must_change INTEGER DEFAULT 1")
+        run("UPDATE users SET must_change = 0 WHERE role = 'Admin'")
+    except Exception:
+        pass
     if not rows("SELECT username FROM users LIMIT 1"):
         run(
-            "INSERT INTO users (username, name, password_hash, role) VALUES (:u, :n, :p, 'Admin')",
+            "INSERT INTO users (username, name, password_hash, role, must_change) "
+            "VALUES (:u, :n, :p, 'Admin', 0)",
             u=os.environ.get("ADMIN_USERNAME", "admin"),
             n="Admin",
             p=hash_password(os.environ.get("ADMIN_PASSWORD", "change-me")),
@@ -169,9 +175,40 @@ def login_page():
                     "username": found[0]["username"],
                     "name": found[0]["name"],
                     "role": found[0]["role"],
+                    "must_change": bool(found[0]["must_change"]),
                 }
                 st.rerun()
             st.error("Wrong username or password.")
+
+
+def change_password_page(user, forced=False):
+    st.header("Change Password")
+    if forced:
+        st.info("You are using a temporary password. Set your own password to continue.")
+    with st.form("change_password", clear_on_submit=True):
+        current = st.text_input("Current password", type="password")
+        new = st.text_input("New password", type="password")
+        again = st.text_input("Confirm new password", type="password")
+        if st.form_submit_button("Change password"):
+            found = rows("SELECT password_hash FROM users WHERE username = :u", u=user["username"])
+            if not found or not check_password(current, found[0]["password_hash"]):
+                st.error("Current password is wrong.")
+            elif len(new) < 8:
+                st.error("New password must be at least 8 characters.")
+            elif new != again:
+                st.error("The new passwords do not match.")
+            elif new == current:
+                st.error("New password must be different from the current one.")
+            else:
+                run(
+                    "UPDATE users SET password_hash = :p, must_change = 0 WHERE username = :u",
+                    p=hash_password(new), u=user["username"],
+                )
+                st.session_state.user["must_change"] = False
+                st.session_state.password_changed = True
+                st.rerun()
+    if st.session_state.pop("password_changed", False):
+        st.success("Password changed.")
 
 
 def my_schedule_page(user):
@@ -320,7 +357,7 @@ def users_page(user):
     with st.form("add_user", clear_on_submit=True):
         name = st.text_input("Full name").strip()
         username = st.text_input("Username").strip().lower()
-        password = st.text_input("Password", type="password")
+        password = st.text_input("Temporary password", type="password")
         role = st.selectbox("Role", ROLES)
         team = st.selectbox("Group", GROUPS)
         if st.form_submit_button("Add"):
@@ -330,8 +367,8 @@ def users_page(user):
                 st.error("That username is already taken.")
             else:
                 run(
-                    "INSERT INTO users (username, name, password_hash, role, team) "
-                    "VALUES (:u, :n, :p, :r, :t)",
+                    "INSERT INTO users (username, name, password_hash, role, team, must_change) "
+                    "VALUES (:u, :n, :p, :r, :t, 1)",
                     u=username, n=name, p=hash_password(password), r=role, t=team,
                 )
                 st.rerun()
@@ -347,7 +384,7 @@ def users_page(user):
         new_team = st.selectbox(
             "Group", GROUPS, index=GROUPS.index(current_team) if current_team in GROUPS else None
         )
-        new_password = st.text_input("New password (leave blank to keep)", type="password")
+        new_password = st.text_input("New temporary password (leave blank to keep)", type="password")
         clear = st.checkbox("Clear this user's schedule and requests")
         remove = st.checkbox("Delete this user")
         if st.form_submit_button("Apply"):
@@ -367,8 +404,8 @@ def users_page(user):
                     )
                     if new_password:
                         run(
-                            "UPDATE users SET password_hash = :p WHERE username = :u",
-                            p=hash_password(new_password), u=target,
+                            "UPDATE users SET password_hash = :p, must_change = :m WHERE username = :u",
+                            p=hash_password(new_password), m=0 if is_self else 1, u=target,
                         )
                 st.rerun()
 
@@ -381,10 +418,18 @@ def main():
         login_page()
         return
 
+    if user.get("must_change"):
+        change_password_page(user, forced=True)
+        if st.button("Log out"):
+            del st.session_state["user"]
+            st.rerun()
+        return
+
     if user["role"] in ("Approver", "Admin"):
         pages = ["Approvals", "Users"]
     else:
         pages = ["My Schedule"]
+    pages.append("Change Password")
 
     with st.sidebar:
         st.write(f'**{user["name"]}**')
@@ -398,6 +443,8 @@ def main():
         my_schedule_page(user)
     elif page == "Approvals":
         approvals_page(user)
+    elif page == "Change Password":
+        change_password_page(user)
     else:
         users_page(user)
 
