@@ -27,6 +27,7 @@ OFF = "OFF"
 SHIFTS = [AM, PM, OFF]
 
 ROLES = ["Employee", "Approver", "Admin"]
+GROUPS = ["HGT", "HPT", "HID"]
 
 st.set_page_config(page_title="Schedule Change Requests", layout="wide")
 
@@ -86,6 +87,10 @@ def init_db():
             decided_by TEXT,
             PRIMARY KEY (username, day))"""
     )
+    try:  # adds the group column to a database made by the first version
+        run("ALTER TABLE users ADD COLUMN team TEXT")
+    except Exception:
+        pass
     if not rows("SELECT username FROM users LIMIT 1"):
         run(
             "INSERT INTO users (username, name, password_hash, role) VALUES (:u, :n, :p, 'Admin')",
@@ -101,12 +106,21 @@ def day_label(iso):
     return date.fromisoformat(iso).strftime("%a, %b %d")
 
 
-def summary_table():
-    total = rows("SELECT COUNT(*) AS n FROM users")[0]["n"]
-    sched = rows("SELECT day, shift, COUNT(*) AS n FROM schedule GROUP BY day, shift")
+def summary_table(team=None):
+    """Counts Employees only. Admins and Approvers are left out."""
+    who = "u.role = 'Employee'" + (" AND u.team = :t" if team else "")
+    params = {"t": team} if team else {}
+    total = rows(f"SELECT COUNT(*) AS n FROM users u WHERE {who}", **params)[0]["n"]
+    sched = rows(
+        "SELECT s.day, s.shift, COUNT(*) AS n FROM schedule s "
+        f"JOIN users u ON u.username = s.username WHERE {who} GROUP BY s.day, s.shift",
+        **params,
+    )
     reqs = rows(
-        "SELECT day, requested_shift, COUNT(*) AS n FROM requests "
-        "WHERE status = 'Pending' GROUP BY day, requested_shift"
+        "SELECT r.day, r.requested_shift, COUNT(*) AS n FROM requests r "
+        f"JOIN users u ON u.username = r.username WHERE {who} AND r.status = 'Pending' "
+        "GROUP BY r.day, r.requested_shift",
+        **params,
     )
     s = {(r["day"], r["shift"]): r["n"] for r in sched}
     q = {(r["day"], r["requested_shift"]): r["n"] for r in reqs}
@@ -132,8 +146,14 @@ def summary_table():
 
 
 def show_summary():
-    st.dataframe(summary_table(), hide_index=True)
-    st.caption("Change requests counts pending requests only.")
+    tabs = st.tabs(["All groups"] + GROUPS)
+    for tab, team in zip(tabs, [None] + GROUPS):
+        with tab:
+            st.dataframe(summary_table(team), hide_index=True)
+    st.caption(
+        "Counts employees only. Change requests counts pending requests only. "
+        "An employee with no group shows under All groups only."
+    )
 
 
 # ---------- Pages ----------
@@ -143,7 +163,7 @@ def login_page():
         username = st.text_input("Username").strip().lower()
         password = st.text_input("Password", type="password")
         if st.form_submit_button("Log in"):
-            found = rows("SELECT * FROM users WHERE username = :u", u=username)
+            found = rows("SELECT * FROM users WHERE lower(username) = :u", u=username)
             if found and check_password(password, found[0]["password_hash"]):
                 st.session_state.user = {
                     "username": found[0]["username"],
@@ -235,27 +255,29 @@ def approvals_page(user):
 
     st.subheader("Pending requests")
     pending = rows(
-        "SELECT r.username, u.name, r.day, r.requested_shift, s.shift AS actual "
+        "SELECT r.username, u.name, u.team, r.day, r.requested_shift, s.shift AS actual "
         "FROM requests r "
         "JOIN users u ON u.username = r.username "
         "LEFT JOIN schedule s ON s.username = r.username AND s.day = r.day "
-        "WHERE r.status = 'Pending' ORDER BY r.day, u.name"
+        "WHERE r.status = 'Pending' AND u.role = 'Employee' ORDER BY r.day, u.team, u.name"
     )
     if not pending:
         st.write("No pending requests.")
         return
 
-    h = st.columns([3, 2, 3, 3, 1, 1])
-    for col, label in zip(h, ["Name", "Date", "Actual", "Requested", "", ""]):
+    widths = [3, 1, 2, 3, 3, 1, 1]
+    h = st.columns(widths)
+    for col, label in zip(h, ["Name", "Group", "Date", "Actual", "Requested", "", ""]):
         col.markdown(f"**{label}**")
     for p in pending:
         key = f'{p["username"]}_{p["day"]}'
-        c = st.columns([3, 2, 3, 3, 1, 1])
+        c = st.columns(widths)
         c[0].write(p["name"])
-        c[1].write(day_label(p["day"]))
-        c[2].write(p["actual"] or "Not set")
-        c[3].write(p["requested_shift"])
-        if c[4].button("Approve", key=f"ok_{key}"):
+        c[1].write(p["team"] or "")
+        c[2].write(day_label(p["day"]))
+        c[3].write(p["actual"] or "Not set")
+        c[4].write(p["requested_shift"])
+        if c[5].button("Approve", key=f"ok_{key}"):
             with engine().begin() as conn:
                 conn.execute(
                     text(
@@ -272,7 +294,7 @@ def approvals_page(user):
                     {"by": user["username"], "u": p["username"], "d": p["day"]},
                 )
             st.rerun()
-        if c[5].button("Reject", key=f"no_{key}"):
+        if c[6].button("Reject", key=f"no_{key}"):
             run(
                 "UPDATE requests SET status = 'Rejected', decided_by = :by "
                 "WHERE username = :u AND day = :d",
@@ -283,9 +305,11 @@ def approvals_page(user):
 
 def users_page(user):
     st.header("Users")
-    people = rows("SELECT username, name, role FROM users ORDER BY role, name")
+    people = rows("SELECT username, name, role, team FROM users ORDER BY role, team, name")
     st.dataframe(
-        pd.DataFrame(people).rename(columns={"username": "Username", "name": "Name", "role": "Role"}),
+        pd.DataFrame(people).rename(
+            columns={"username": "Username", "name": "Name", "role": "Role", "team": "Group"}
+        ),
         hide_index=True,
     )
     if user["role"] != "Admin":
@@ -298,6 +322,7 @@ def users_page(user):
         username = st.text_input("Username").strip().lower()
         password = st.text_input("Password", type="password")
         role = st.selectbox("Role", ROLES)
+        team = st.selectbox("Group", GROUPS)
         if st.form_submit_button("Add"):
             if not (name and username and password):
                 st.error("Fill in all fields.")
@@ -305,8 +330,9 @@ def users_page(user):
                 st.error("That username is already taken.")
             else:
                 run(
-                    "INSERT INTO users (username, name, password_hash, role) VALUES (:u, :n, :p, :r)",
-                    u=username, n=name, p=hash_password(password), r=role,
+                    "INSERT INTO users (username, name, password_hash, role, team) "
+                    "VALUES (:u, :n, :p, :r, :t)",
+                    u=username, n=name, p=hash_password(password), r=role, t=team,
                 )
                 st.rerun()
 
@@ -315,8 +341,12 @@ def users_page(user):
     target = st.selectbox(
         "User", list(by_username), format_func=lambda x: f'{by_username[x]["name"]} ({x})'
     )
-    with st.form("edit_user"):
+    current_team = by_username[target]["team"]
+    with st.form(f"edit_user_{target}"):
         new_role = st.selectbox("Role", ROLES, index=ROLES.index(by_username[target]["role"]))
+        new_team = st.selectbox(
+            "Group", GROUPS, index=GROUPS.index(current_team) if current_team in GROUPS else None
+        )
         new_password = st.text_input("New password (leave blank to keep)", type="password")
         clear = st.checkbox("Clear this user's schedule and requests")
         remove = st.checkbox("Delete this user")
@@ -331,7 +361,10 @@ def users_page(user):
                 if remove:
                     run("DELETE FROM users WHERE username = :u", u=target)
                 else:
-                    run("UPDATE users SET role = :r WHERE username = :u", r=new_role, u=target)
+                    run(
+                        "UPDATE users SET role = :r, team = :t WHERE username = :u",
+                        r=new_role, t=new_team, u=target,
+                    )
                     if new_password:
                         run(
                             "UPDATE users SET password_hash = :p WHERE username = :u",
@@ -348,9 +381,10 @@ def main():
         login_page()
         return
 
-    pages = ["My Schedule"]
     if user["role"] in ("Approver", "Admin"):
-        pages += ["Approvals", "Users"]
+        pages = ["Approvals", "Users"]
+    else:
+        pages = ["My Schedule"]
 
     with st.sidebar:
         st.write(f'**{user["name"]}**')
