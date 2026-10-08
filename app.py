@@ -36,8 +36,8 @@ st.set_page_config(page_title="Schedule Change Requests", layout="wide")
 @st.cache_resource
 def engine():
     url = os.environ.get("DATABASE_URL", "sqlite:///shift_requests.db")
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgres"):  # accept any Postgres URL form and use the psycopg 3 driver
+        url = "postgresql+psycopg://" + url.split("://", 1)[1]
     return create_engine(url, pool_pre_ping=True)
 
 
