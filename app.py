@@ -373,6 +373,71 @@ def users_page(user):
                 )
                 st.rerun()
 
+    st.subheader("Bulk upload users")
+    st.caption(
+        "Upload a CSV with the columns Name, Username, Role, Group. "
+        f"Role is one of {', '.join(ROLES)} (blank means Employee). "
+        f"Group is one of {', '.join(GROUPS)}. "
+        "Everyone in the file gets the same temporary password and must change it at first login."
+    )
+    st.download_button(
+        "Download CSV template",
+        "Name,Username,Role,Group\nMaria Cruz,maria.cruz,Employee,HGT\n",
+        file_name="users_template.csv",
+        mime="text/csv",
+    )
+    for kind, message in st.session_state.pop("bulk_result", []):
+        (st.success if kind == "ok" else st.warning)(message)
+    with st.form("bulk_upload", clear_on_submit=True):
+        upload = st.file_uploader("CSV file", type="csv")
+        temp_password = st.text_input("Temporary password for all users in the file", type="password")
+        if st.form_submit_button("Upload users"):
+            if upload is None or not temp_password:
+                st.error("Choose a CSV file and type a temporary password.")
+            else:
+                try:
+                    df = pd.read_csv(upload, dtype=str, encoding="utf-8-sig").fillna("")
+                    df.columns = [str(c).strip().lower() for c in df.columns]
+                except Exception:
+                    df = None
+                if df is None or not {"name", "username"} <= set(df.columns):
+                    st.error("Could not read the file. It needs at least Name and Username columns.")
+                else:
+                    taken = {r["username"].lower() for r in rows("SELECT username FROM users")}
+                    added, skipped = 0, []
+                    with st.spinner("Adding users..."):
+                        for i, row in df.iterrows():
+                            line = i + 2  # row number as shown in a spreadsheet
+                            name = row["name"].strip()
+                            username = row["username"].strip().lower()
+                            role = row.get("role", "").strip().title() or "Employee"
+                            team = row.get("group", "").strip().upper() or None
+                            if not name and not username:
+                                continue
+                            if not name or not username:
+                                skipped.append(f"Row {line}: name or username is blank")
+                            elif username in taken:
+                                skipped.append(f"Row {line}: username {username} already exists")
+                            elif role not in ROLES:
+                                skipped.append(f"Row {line}: role {row.get('role', '')} is not valid")
+                            elif team and team not in GROUPS:
+                                skipped.append(f"Row {line}: group {team} is not valid")
+                            elif role == "Employee" and not team:
+                                skipped.append(f"Row {line}: employee {username} has no group")
+                            else:
+                                run(
+                                    "INSERT INTO users (username, name, password_hash, role, team, must_change) "
+                                    "VALUES (:u, :n, :p, :r, :t, 1)",
+                                    u=username, n=name, p=hash_password(temp_password), r=role, t=team,
+                                )
+                                taken.add(username)
+                                added += 1
+                    result = [("ok", f"Added {added} user(s).")]
+                    if skipped:
+                        result.append(("skip", "Skipped:  \n" + "  \n".join(skipped)))
+                    st.session_state.bulk_result = result
+                    st.rerun()
+
     st.subheader("Edit user")
     by_username = {p["username"]: p for p in people}
     target = st.selectbox(
