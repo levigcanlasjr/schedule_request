@@ -26,7 +26,9 @@ PM = "2:00 PM - 11:00 PM"
 OFF = "OFF"
 SHIFTS = [AM, PM, OFF]
 
-ROLES = ["Employee", "Approver", "Admin"]
+ROLES = ["Employee", "Group Leader", "Approver", "Admin"]
+# Roles that submit schedules and are counted in totals
+COUNTED = "('Employee', 'Group Leader')"
 GROUPS = ["HGT", "HPT", "HID"]
 
 st.set_page_config(page_title="Schedule Change Requests", layout="wide")
@@ -114,7 +116,7 @@ def day_label(iso):
 
 def summary_table(team=None):
     """Counts Employees only. Admins and Approvers are left out."""
-    who = "u.role = 'Employee'" + (" AND u.team = :t" if team else "")
+    who = f"u.role IN {COUNTED}" + (" AND u.team = :t" if team else "")
     params = {"t": team} if team else {}
     total = rows(f"SELECT COUNT(*) AS n FROM users u WHERE {who}", **params)[0]["n"]
     sched = rows(
@@ -157,7 +159,7 @@ def show_summary():
         with tab:
             st.dataframe(summary_table(team), hide_index=True)
     st.caption(
-        "Counts employees only. Change requests counts pending requests only. "
+        "Counts employees and group leaders only. Change requests counts pending requests only. "
         "An employee with no group shows under All groups only."
     )
 
@@ -175,6 +177,7 @@ def login_page():
                     "username": found[0]["username"],
                     "name": found[0]["name"],
                     "role": found[0]["role"],
+                    "team": found[0]["team"],
                     "must_change": bool(found[0]["must_change"]),
                 }
                 st.rerun()
@@ -296,7 +299,7 @@ def approvals_page(user):
         "FROM requests r "
         "JOIN users u ON u.username = r.username "
         "LEFT JOIN schedule s ON s.username = r.username AND s.day = r.day "
-        "WHERE r.status = 'Pending' AND u.role = 'Employee' ORDER BY r.day, u.team, u.name"
+        f"WHERE r.status = 'Pending' AND u.role IN {COUNTED} ORDER BY r.day, u.team, u.name"
     )
     if not pending:
         st.write("No pending requests.")
@@ -338,6 +341,66 @@ def approvals_page(user):
                 by=user["username"], u=p["username"], d=p["day"],
             )
             st.rerun()
+
+
+def submissions_page(user):
+    st.header("Submissions")
+    leader = user["role"] == "Group Leader"
+    params = {"first": DAYS[0].isoformat(), "last": DAYS[-1].isoformat()}
+    where = f"u.role IN {COUNTED}"
+    if leader:
+        where += " AND u.team = :t"
+        params["t"] = user["team"]
+    people = rows(
+        "SELECT u.name, u.username, u.team, COUNT(s.day) AS days FROM users u "
+        "LEFT JOIN schedule s ON s.username = u.username AND s.day BETWEEN :first AND :last "
+        f"WHERE {where} GROUP BY u.name, u.username, u.team ORDER BY u.team, u.name",
+        **params,
+    )
+    total_days = len(DAYS)
+
+    def status(n):
+        if n >= total_days:
+            return "Submitted"
+        return "Partially submitted" if n > 0 else "Not submitted"
+
+    df = pd.DataFrame(
+        [
+            {
+                "Name": p["name"],
+                "Username": p["username"],
+                "Group": p["team"] or "",
+                "Days set": f'{p["days"]} of {total_days}',
+                "Status": status(p["days"]),
+            }
+            for p in people
+        ],
+        columns=["Name", "Username", "Group", "Days set", "Status"],
+    )
+
+    if leader:
+        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+    else:
+        team = st.selectbox("Group", ["All groups"] + GROUPS)
+        if team != "All groups":
+            df = df[df["Group"] == team]
+
+    counts = df["Status"].value_counts()
+    c = st.columns(3)
+    c[0].metric("Submitted", int(counts.get("Submitted", 0)))
+    c[1].metric("Partially submitted", int(counts.get("Partially submitted", 0)))
+    c[2].metric("Not submitted", int(counts.get("Not submitted", 0)))
+
+    choices = ["Submitted", "Partially submitted", "Not submitted"]
+    picked = st.multiselect("Status", choices, default=choices)
+    df = df[df["Status"].isin(picked)]
+    st.dataframe(df, hide_index=True)
+    st.download_button(
+        "Download this list (CSV)",
+        df.to_csv(index=False),
+        file_name="submission_status.csv",
+        mime="text/csv",
+    )
 
 
 def users_page(user):
@@ -422,8 +485,8 @@ def users_page(user):
                                 skipped.append(f"Row {line}: role {row.get('role', '')} is not valid")
                             elif team and team not in GROUPS:
                                 skipped.append(f"Row {line}: group {team} is not valid")
-                            elif role == "Employee" and not team:
-                                skipped.append(f"Row {line}: employee {username} has no group")
+                            elif role in ("Employee", "Group Leader") and not team:
+                                skipped.append(f"Row {line}: {username} needs a group")
                             else:
                                 run(
                                     "INSERT INTO users (username, name, password_hash, role, team, must_change) "
@@ -491,7 +554,9 @@ def main():
         return
 
     if user["role"] in ("Approver", "Admin"):
-        pages = ["Approvals", "Users"]
+        pages = ["Approvals", "Submissions", "Users"]
+    elif user["role"] == "Group Leader":
+        pages = ["My Schedule", "Submissions"]
     else:
         pages = ["My Schedule"]
     pages.append("Change Password")
@@ -508,6 +573,8 @@ def main():
         my_schedule_page(user)
     elif page == "Approvals":
         approvals_page(user)
+    elif page == "Submissions":
+        submissions_page(user)
     elif page == "Change Password":
         change_password_page(user)
     else:
