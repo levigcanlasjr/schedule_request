@@ -18,7 +18,9 @@ from sqlalchemy import create_engine, text
 
 # ---------- Settings ----------
 START = date(2026, 10, 24)
-END = date(2026, 11, 3)
+END = date(2026, 11, 6)
+# End of the first schedule period. Anyone complete up to this date still counts as Submitted.
+FIRST_END = date(2026, 11, 3)
 DAYS = [START + timedelta(days=i) for i in range((END - START).days + 1)]
 
 AM = "5:00 AM - 2:00 PM"
@@ -87,6 +89,14 @@ def init_db():
             requested_shift TEXT NOT NULL,
             status TEXT NOT NULL,
             decided_by TEXT,
+            PRIMARY KEY (username, day))"""
+    )
+    run(
+        """CREATE TABLE IF NOT EXISTS attendance (
+            username TEXT NOT NULL,
+            day TEXT NOT NULL,
+            status TEXT NOT NULL,
+            marked_by TEXT,
             PRIMARY KEY (username, day))"""
     )
     try:  # adds the group column to a database made by the first version
@@ -473,25 +483,173 @@ def all_schedules_page(user):
         st.success(st.session_state.pop("admin_sched_msg"))
 
 
+ATTENDANCE = ["Not marked", "Present", "Late", "Absent", "On leave"]
+
+
+def by_day_page(user):
+    st.header("By Day")
+    leader = user["role"] == "Group Leader"
+    params = {}
+    where = f"u.role IN {COUNTED}"
+    if leader:
+        where += " AND u.team = :t"
+        params["t"] = user["team"]
+    people = rows(f"SELECT u.username, u.name, u.team FROM users u WHERE {where} ORDER BY u.name", **params)
+    sched = {
+        (r["username"], r["day"]): r["shift"]
+        for r in rows(f"SELECT s.username, s.day, s.shift FROM schedule s JOIN users u ON u.username = s.username WHERE {where}", **params)
+    }
+    pend = {
+        (r["username"], r["day"]): r["requested_shift"]
+        for r in rows(
+            "SELECT r.username, r.day, r.requested_shift FROM requests r JOIN users u ON u.username = r.username "
+            f"WHERE {where} AND r.status = 'Pending'",
+            **params,
+        )
+    }
+    att = {
+        (r["username"], r["day"]): r["status"]
+        for r in rows(f"SELECT a.username, a.day, a.status FROM attendance a JOIN users u ON u.username = a.username WHERE {where}", **params)
+    }
+
+    groups = [user["team"]] if leader else GROUPS + (["No group"] if any(not p["team"] for p in people) else [])
+    def members(g):
+        return [p for p in people if (p["team"] or "No group") == g]
+
+    if leader:
+        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+
+    # ---------- One day ----------
+    today = date.today()
+    default = DAYS.index(today) if today in DAYS else 0
+    day = st.selectbox("Date", DAYS, index=default, format_func=lambda d: d.strftime("%a, %b %d"))
+    k = day.isoformat()
+    export = []
+    for g in groups:
+        team_people = members(g)
+        st.subheader(f"{g} ({len(team_people)})")
+        by_shift = {sh: [] for sh in SHIFTS + ["Not set"]}
+        for p in team_people:
+            by_shift[sched.get((p["username"], k), "Not set")].append(p)
+        cols = st.columns(4)
+        for col, sh in zip(cols, SHIFTS + ["Not set"]):
+            col.metric(sh, len(by_shift[sh]))
+
+        with st.form(f"att_{g}_{k}"):
+            picks = {}
+            for sh in [AM, PM]:
+                on_shift = by_shift[sh]
+                marked = [att.get((p["username"], k), "Not marked") for p in on_shift]
+                tally = ", ".join(f"{m} {marked.count(m)}" for m in ATTENDANCE[1:] if marked.count(m))
+                st.markdown(f"**{sh}** ({len(on_shift)} scheduled{'; ' + tally if tally else ''})")
+                if not on_shift:
+                    st.caption("No one scheduled.")
+                for p in on_shift:
+                    label = p["name"]
+                    if (p["username"], k) in pend:
+                        label += f' (req: {SHORT[pend[(p["username"], k)]]})'
+                    c = st.columns([3, 2])
+                    c[0].write(label)
+                    cur = att.get((p["username"], k), "Not marked")
+                    picks[p["username"]] = c[1].selectbox(
+                        "Attendance", ATTENDANCE, index=ATTENDANCE.index(cur),
+                        key=f"att_{p['username']}_{k}", label_visibility="collapsed",
+                    )
+            for sh in [OFF, "Not set"]:
+                names = []
+                for p in by_shift[sh]:
+                    label = p["name"]
+                    if (p["username"], k) in pend:
+                        label += f' (req: {SHORT[pend[(p["username"], k)]]})'
+                    names.append(label)
+                st.markdown(f"**{sh}** ({len(names)}): " + (", ".join(names) if names else "none"))
+            save = st.form_submit_button(f"Save attendance for {g}")
+        if save:
+            for u, new in picks.items():
+                cur = att.get((u, k))
+                if new == "Not marked" and cur:
+                    run("DELETE FROM attendance WHERE username = :u AND day = :d", u=u, d=k)
+                elif new != "Not marked" and new != cur:
+                    run(
+                        "INSERT INTO attendance (username, day, status, marked_by) VALUES (:u, :d, :s, :by) "
+                        "ON CONFLICT (username, day) DO UPDATE SET status = :s, marked_by = :by",
+                        u=u, d=k, s=new, by=user["username"],
+                    )
+            st.session_state.att_msg = f"Attendance saved for {g}."
+            st.rerun()
+
+        for sh in SHIFTS + ["Not set"]:
+            for p in by_shift[sh]:
+                export.append(
+                    {
+                        "Date": day_label(k),
+                        "Group": g,
+                        "Name": p["name"],
+                        "Shift": sh,
+                        "Pending request": pend.get((p["username"], k), ""),
+                        "Attendance": att.get((p["username"], k), "Not marked") if sh in (AM, PM) else "",
+                    }
+                )
+    if "att_msg" in st.session_state:
+        st.success(st.session_state.pop("att_msg"))
+    st.download_button(
+        "Download this day (CSV)",
+        pd.DataFrame(export).to_csv(index=False),
+        file_name=f"schedule_{k}.csv",
+        mime="text/csv",
+    )
+
+    # ---------- Full view ----------
+    st.subheader("Full view (all days)")
+    st.caption("Shift counts per group per day. Attendance counts people on the 5 AM and 2 PM shifts.")
+    full = []
+    for d in DAYS:
+        dk = d.isoformat()
+        for g in groups:
+            team_people = members(g)
+            shifts = [sched.get((p["username"], dk), "Not set") for p in team_people]
+            marks = [att.get((p["username"], dk), "Not marked") for p, sh in zip(team_people, shifts) if sh in (AM, PM)]
+            line = {"Date": d.strftime("%a %b %d"), "Group": g}
+            for sh in SHIFTS + ["Not set"]:
+                line[SHORT.get(sh, sh)] = shifts.count(sh)
+            for m in ATTENDANCE[1:] + ["Not marked"]:
+                line[m] = marks.count(m)
+            full.append(line)
+    full_df = pd.DataFrame(full)
+    if not leader and len(groups) > 1:
+        pick = st.selectbox("Group", ["All groups"] + groups, key="full_group")
+        if pick != "All groups":
+            full_df = full_df[full_df["Group"] == pick]
+    st.dataframe(full_df, hide_index=True)
+    st.download_button(
+        "Download full view (CSV)", full_df.to_csv(index=False), file_name="full_view.csv", mime="text/csv"
+    )
+
+
 def submissions_page(user):
     st.header("Submissions")
     leader = user["role"] == "Group Leader"
-    params = {"first": DAYS[0].isoformat(), "last": DAYS[-1].isoformat()}
+    params = {"first": DAYS[0].isoformat(), "last": DAYS[-1].isoformat(), "first_end": FIRST_END.isoformat()}
     where = f"u.role IN {COUNTED}"
     if leader:
         where += " AND u.team = :t"
         params["t"] = user["team"]
     people = rows(
-        "SELECT u.name, u.username, u.team, COUNT(s.day) AS days FROM users u "
+        "SELECT u.name, u.username, u.team, COUNT(s.day) AS days, "
+        "COUNT(CASE WHEN s.day <= :first_end THEN 1 END) AS first_days FROM users u "
         "LEFT JOIN schedule s ON s.username = u.username AND s.day BETWEEN :first AND :last "
         f"WHERE {where} GROUP BY u.name, u.username, u.team ORDER BY u.team, u.name",
         **params,
     )
     total_days = len(DAYS)
+    first_total = len([d for d in DAYS if d <= FIRST_END])
+    first_label = f"Submitted [{FIRST_END.strftime('%b')} {FIRST_END.day}]"
 
-    def status(n):
+    def status(n, first_n):
         if n >= total_days:
             return "Submitted"
+        if first_n >= first_total:
+            return first_label
         return "Partially submitted" if n > 0 else "Not submitted"
 
     df = pd.DataFrame(
@@ -501,7 +659,7 @@ def submissions_page(user):
                 "Username": p["username"],
                 "Group": p["team"] or "",
                 "Days set": f'{p["days"]} of {total_days}',
-                "Status": status(p["days"]),
+                "Status": status(p["days"], p["first_days"]),
             }
             for p in people
         ],
@@ -517,11 +675,12 @@ def submissions_page(user):
 
     counts = df["Status"].value_counts()
     c = st.columns(3)
-    c[0].metric("Submitted", int(counts.get("Submitted", 0)))
+    c[0].metric("Submitted", int(counts.get("Submitted", 0)) + int(counts.get(first_label, 0)))
     c[1].metric("Partially submitted", int(counts.get("Partially submitted", 0)))
     c[2].metric("Not submitted", int(counts.get("Not submitted", 0)))
 
-    choices = ["Submitted", "Partially submitted", "Not submitted"]
+    choices = ["Submitted", first_label, "Partially submitted", "Not submitted"]
+    st.caption(f"Submitted includes {first_label}: complete up to {FIRST_END.strftime('%B')} {FIRST_END.day}, but not the later days.")
     picked = st.multiselect("Status", choices, default=choices)
     df = df[df["Status"].isin(picked)]
     st.dataframe(df, hide_index=True)
@@ -653,6 +812,7 @@ def users_page(user):
                 if clear or remove:
                     run("DELETE FROM schedule WHERE username = :u", u=target)
                     run("DELETE FROM requests WHERE username = :u", u=target)
+                    run("DELETE FROM attendance WHERE username = :u", u=target)
                 if remove:
                     run("DELETE FROM users WHERE username = :u", u=target)
                 else:
@@ -684,9 +844,9 @@ def main():
         return
 
     if user["role"] in ("Approver", "Admin"):
-        pages = ["Approvals", "All Schedules", "Submissions", "Users"]
+        pages = ["Approvals", "All Schedules", "By Day", "Submissions", "Users"]
     elif user["role"] == "Group Leader":
-        pages = ["My Schedule", "All Schedules", "Submissions"]
+        pages = ["My Schedule", "All Schedules", "By Day", "Submissions"]
     else:
         pages = ["My Schedule"]
     pages.append("Change Password")
@@ -705,6 +865,8 @@ def main():
         approvals_page(user)
     elif page == "All Schedules":
         all_schedules_page(user)
+    elif page == "By Day":
+        by_day_page(user)
     elif page == "Submissions":
         submissions_page(user)
     elif page == "Change Password":
