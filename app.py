@@ -305,6 +305,9 @@ def approvals_page(user):
         st.write("No pending requests.")
         return
 
+    can_approve = user["role"] == "Approver"
+    if not can_approve:
+        st.caption("View only. Approvers approve or reject requests.")
     widths = [3, 1, 2, 3, 3, 1, 1]
     h = st.columns(widths)
     for col, label in zip(h, ["Name", "Group", "Date", "Actual", "Requested", "", ""]):
@@ -317,6 +320,8 @@ def approvals_page(user):
         c[2].write(day_label(p["day"]))
         c[3].write(p["actual"] or "Not set")
         c[4].write(p["requested_shift"])
+        if not can_approve:
+            continue
         if c[5].button("Approve", key=f"ok_{key}"):
             with engine().begin() as conn:
                 conn.execute(
@@ -341,6 +346,131 @@ def approvals_page(user):
                 by=user["username"], u=p["username"], d=p["day"],
             )
             st.rerun()
+
+
+SHORT = {AM: "5AM-2PM", PM: "2PM-11PM", OFF: "OFF"}
+
+
+def all_schedules_page(user):
+    st.header("All Schedules")
+    leader = user["role"] == "Group Leader"
+    params = {}
+    where = f"u.role IN {COUNTED}"
+    if leader:
+        where += " AND u.team = :t"
+        params["t"] = user["team"]
+    people = rows(f"SELECT u.username, u.name, u.team FROM users u WHERE {where} ORDER BY u.team, u.name", **params)
+    sched = {
+        (r["username"], r["day"]): r["shift"]
+        for r in rows(f"SELECT s.username, s.day, s.shift FROM schedule s JOIN users u ON u.username = s.username WHERE {where}", **params)
+    }
+    pend = {
+        (r["username"], r["day"]): r["requested_shift"]
+        for r in rows(
+            "SELECT r.username, r.day, r.requested_shift FROM requests r JOIN users u ON u.username = r.username "
+            f"WHERE {where} AND r.status = 'Pending'",
+            **params,
+        )
+    }
+
+    data = []
+    for p in people:
+        line = {"Name": p["name"], "Group": p["team"] or ""}
+        for d in DAYS:
+            k = d.isoformat()
+            cell = SHORT.get(sched.get((p["username"], k)), "")
+            if (p["username"], k) in pend:
+                cell = f'{cell} (req: {SHORT[pend[(p["username"], k)]]})'.strip()
+            line[d.strftime("%a %b %d")] = cell
+        data.append(line)
+    df = pd.DataFrame(data, columns=["Name", "Group"] + [d.strftime("%a %b %d") for d in DAYS])
+
+    if leader:
+        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+    else:
+        team = st.selectbox("Group", ["All groups"] + GROUPS, key="all_sched_group")
+        if team != "All groups":
+            df = df[df["Group"] == team]
+    st.caption("A blank cell means the day is not set. (req: ...) shows a pending change request.")
+    st.dataframe(df, hide_index=True)
+    st.download_button(
+        "Download this table (CSV)", df.to_csv(index=False), file_name="all_schedules.csv", mime="text/csv"
+    )
+
+    if user["role"] != "Admin" or not people:
+        return
+
+    st.subheader("Edit an employee's schedule")
+    st.caption(
+        "Changes to the actual schedule save right away and skip approval. "
+        "Pending requests stay open for an approver. You can also add or remove a request for this person."
+    )
+    names = {p["username"]: p for p in people}
+    target = st.selectbox(
+        "Employee",
+        list(names),
+        format_func=lambda x: f'{names[x]["name"]} ({names[x]["team"] or "no group"})',
+        key="edit_sched_target",
+    )
+    opts_actual = ["Not set"] + SHIFTS
+    opts_req = ["No request"] + SHIFTS
+    new_actual, new_req = {}, {}
+    with st.form(f"admin_sched_{target}"):
+        h = st.columns([2, 3, 3])
+        h[0].markdown("**Date**")
+        h[1].markdown("**Actual schedule**")
+        h[2].markdown("**Pending request**")
+        for d in DAYS:
+            k = d.isoformat()
+            c = st.columns([2, 3, 3])
+            c[0].write(day_label(k))
+            cur = sched.get((target, k))
+            new_actual[k] = c[1].selectbox(
+                "Actual", opts_actual, index=opts_actual.index(cur) if cur in opts_actual else 0,
+                key=f"aa_{target}_{k}", label_visibility="collapsed",
+            )
+            curr = pend.get((target, k))
+            new_req[k] = c[2].selectbox(
+                "Request", opts_req, index=opts_req.index(curr) if curr in opts_req else 0,
+                key=f"ar_{target}_{k}", label_visibility="collapsed",
+            )
+        saved = st.form_submit_button("Save changes")
+
+    if saved:
+        changed = 0
+        for k in new_actual:
+            cur, new = sched.get((target, k)), new_actual[k]
+            if new == "Not set" and cur:
+                run("DELETE FROM schedule WHERE username = :u AND day = :d", u=target, d=k)
+                changed += 1
+            elif new != "Not set" and new != cur:
+                run(
+                    "INSERT INTO schedule (username, day, shift) VALUES (:u, :d, :s) "
+                    "ON CONFLICT (username, day) DO UPDATE SET shift = :s",
+                    u=target, d=k, s=new,
+                )
+                changed += 1
+            curr, newr = pend.get((target, k)), new_req[k]
+            if newr == curr or (newr == "No request" and not curr):
+                continue
+            if newr == "No request":
+                run(
+                    "DELETE FROM requests WHERE username = :u AND day = :d AND status = 'Pending'",
+                    u=target, d=k,
+                )
+            else:
+                run(
+                    "INSERT INTO requests (username, day, requested_shift, status, decided_by) "
+                    "VALUES (:u, :d, :s, 'Pending', NULL) "
+                    "ON CONFLICT (username, day) DO UPDATE SET "
+                    "requested_shift = :s, status = 'Pending', decided_by = NULL",
+                    u=target, d=k, s=newr,
+                )
+            changed += 1
+        st.session_state.admin_sched_msg = f"Saved {changed} change(s) for {names[target]['name']}."
+        st.rerun()
+    if "admin_sched_msg" in st.session_state:
+        st.success(st.session_state.pop("admin_sched_msg"))
 
 
 def submissions_page(user):
@@ -554,9 +684,9 @@ def main():
         return
 
     if user["role"] in ("Approver", "Admin"):
-        pages = ["Approvals", "Submissions", "Users"]
+        pages = ["Approvals", "All Schedules", "Submissions", "Users"]
     elif user["role"] == "Group Leader":
-        pages = ["My Schedule", "Submissions"]
+        pages = ["My Schedule", "All Schedules", "Submissions"]
     else:
         pages = ["My Schedule"]
     pages.append("Change Password")
@@ -573,6 +703,8 @@ def main():
         my_schedule_page(user)
     elif page == "Approvals":
         approvals_page(user)
+    elif page == "All Schedules":
+        all_schedules_page(user)
     elif page == "Submissions":
         submissions_page(user)
     elif page == "Change Password":
