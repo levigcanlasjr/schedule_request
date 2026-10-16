@@ -10,7 +10,7 @@ import hashlib
 import hmac
 import os
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -31,7 +31,9 @@ SHIFTS = [AM, PM, OFF]
 ROLES = ["Employee", "Group Leader", "Approver", "Admin"]
 # Roles that submit schedules and are counted in totals
 COUNTED = "('Employee', 'Group Leader')"
-GROUPS = ["HGT", "HPT", "HID"]
+GROUPS = ["HGT", "HPT", "HID"]  # groups that hold employees and group leaders
+ALL_GROUPS = GROUPS + ["HiEx"]  # HiEx is for approvers and admin
+LOCAL_TZ = timezone(timedelta(hours=8))
 
 st.set_page_config(page_title="Schedule Change Requests", layout="wide")
 
@@ -99,6 +101,10 @@ def init_db():
             marked_by TEXT,
             PRIMARY KEY (username, day))"""
     )
+    try:  # adds the time a request was approved or rejected
+        run("ALTER TABLE requests ADD COLUMN decided_at TEXT")
+    except Exception:
+        pass
     try:  # adds the group column to a database made by the first version
         run("ALTER TABLE users ADD COLUMN team TEXT")
     except Exception:
@@ -120,6 +126,29 @@ def init_db():
 
 
 # ---------- Shared pieces ----------
+def now_local():
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def decision_note(status, by_name, at):
+    """Example: Approved by Maria Cruz, Oct 17 9:30 PM"""
+    note = f"{status} by {by_name or 'unknown'}"
+    if at:
+        try:
+            note += ", " + datetime.strptime(at, "%Y-%m-%d %H:%M").strftime("%b %d %I:%M %p").replace(" 0", " ")
+        except ValueError:
+            pass
+    return note
+
+
+def group_error(role, team):
+    if role in ("Employee", "Group Leader") and team not in GROUPS:
+        return f"{role} must be in {', '.join(GROUPS)}."
+    if team and team not in ALL_GROUPS:
+        return f"Group {team} is not valid."
+    return None
+
+
 def day_label(iso):
     return date.fromisoformat(iso).strftime("%a, %b %d")
 
@@ -228,7 +257,14 @@ def my_schedule_page(user):
     st.header("My Schedule")
     u = user["username"]
     sched = {r["day"]: r["shift"] for r in rows("SELECT day, shift FROM schedule WHERE username = :u", u=u)}
-    reqs = {r["day"]: r for r in rows("SELECT * FROM requests WHERE username = :u", u=u)}
+    reqs = {
+        r["day"]: r
+        for r in rows(
+            "SELECT r.*, d.name AS decided_name FROM requests r "
+            "LEFT JOIN users d ON d.username = r.decided_by WHERE r.username = :u",
+            u=u,
+        )
+    }
 
     st.caption(
         "Set your actual schedule first. Once saved, it is locked. "
@@ -267,7 +303,10 @@ def my_schedule_page(user):
                 pending_now[k] = pending
             else:
                 c[2].caption("Set actual schedule first")
-            c[3].write(f'{r["status"]}: {r["requested_shift"]}' if r else "")
+            if r and r["status"] in ("Approved", "Rejected"):
+                c[3].write(f'{r["requested_shift"]}: {decision_note(r["status"], r["decided_name"], r["decided_at"])}')
+            elif r:
+                c[3].write(f'{r["status"]}: {r["requested_shift"]}')
         saved = st.form_submit_button("Save")
 
     if saved:
@@ -290,7 +329,7 @@ def my_schedule_page(user):
                     "INSERT INTO requests (username, day, requested_shift, status, decided_by) "
                     "VALUES (:u, :d, :s, 'Pending', NULL) "
                     "ON CONFLICT (username, day) DO UPDATE SET "
-                    "requested_shift = :s, status = 'Pending', decided_by = NULL",
+                    "requested_shift = :s, status = 'Pending', decided_by = NULL, decided_at = NULL",
                     u=u, d=k, s=choice,
                 )
         st.rerun()
@@ -299,9 +338,28 @@ def my_schedule_page(user):
     show_summary()
 
 
+def can_decide(user, request_owner, owner_team):
+    if user["role"] in ("Approver", "Admin"):
+        return True
+    if user["role"] == "Group Leader":
+        return owner_team == user["team"] and request_owner != user["username"]
+    return False
+
+
 def approvals_page(user):
     st.header("Approvals")
-    show_summary()
+    leader = user["role"] == "Group Leader"
+    if leader:
+        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+        st.dataframe(summary_table(user["team"]), hide_index=True)
+    else:
+        show_summary()
+
+    params = {}
+    team_filter = ""
+    if leader:
+        team_filter = " AND u.team = :t"
+        params["t"] = user["team"]
 
     st.subheader("Pending requests")
     pending = rows(
@@ -309,53 +367,81 @@ def approvals_page(user):
         "FROM requests r "
         "JOIN users u ON u.username = r.username "
         "LEFT JOIN schedule s ON s.username = r.username AND s.day = r.day "
-        f"WHERE r.status = 'Pending' AND u.role IN {COUNTED} ORDER BY r.day, u.team, u.name"
+        f"WHERE r.status = 'Pending' AND u.role IN {COUNTED}{team_filter} ORDER BY r.day, u.team, u.name",
+        **params,
     )
     if not pending:
         st.write("No pending requests.")
-        return
+    else:
+        if leader:
+            st.caption("Your own requests go to an approver.")
+        widths = [3, 1, 2, 3, 3, 1, 1]
+        h = st.columns(widths)
+        for col, label in zip(h, ["Name", "Group", "Date", "Actual", "Requested", "", ""]):
+            col.markdown(f"**{label}**")
+        for p in pending:
+            key = f'{p["username"]}_{p["day"]}'
+            c = st.columns(widths)
+            c[0].write(p["name"])
+            c[1].write(p["team"] or "")
+            c[2].write(day_label(p["day"]))
+            c[3].write(p["actual"] or "Not set")
+            c[4].write(p["requested_shift"])
+            if not can_decide(user, p["username"], p["team"]):
+                c[5].caption("Needs an approver")
+                continue
+            if c[5].button("Approve", key=f"ok_{key}"):
+                with engine().begin() as conn:
+                    conn.execute(
+                        text(
+                            "INSERT INTO schedule (username, day, shift) VALUES (:u, :d, :s) "
+                            "ON CONFLICT (username, day) DO UPDATE SET shift = :s"
+                        ),
+                        {"u": p["username"], "d": p["day"], "s": p["requested_shift"]},
+                    )
+                    conn.execute(
+                        text(
+                            "UPDATE requests SET status = 'Approved', decided_by = :by, decided_at = :at "
+                            "WHERE username = :u AND day = :d"
+                        ),
+                        {"by": user["username"], "at": now_local(), "u": p["username"], "d": p["day"]},
+                    )
+                st.rerun()
+            if c[6].button("Reject", key=f"no_{key}"):
+                run(
+                    "UPDATE requests SET status = 'Rejected', decided_by = :by, decided_at = :at "
+                    "WHERE username = :u AND day = :d",
+                    by=user["username"], at=now_local(), u=p["username"], d=p["day"],
+                )
+                st.rerun()
 
-    can_approve = user["role"] == "Approver"
-    if not can_approve:
-        st.caption("View only. Approvers approve or reject requests.")
-    widths = [3, 1, 2, 3, 3, 1, 1]
-    h = st.columns(widths)
-    for col, label in zip(h, ["Name", "Group", "Date", "Actual", "Requested", "", ""]):
-        col.markdown(f"**{label}**")
-    for p in pending:
-        key = f'{p["username"]}_{p["day"]}'
-        c = st.columns(widths)
-        c[0].write(p["name"])
-        c[1].write(p["team"] or "")
-        c[2].write(day_label(p["day"]))
-        c[3].write(p["actual"] or "Not set")
-        c[4].write(p["requested_shift"])
-        if not can_approve:
-            continue
-        if c[5].button("Approve", key=f"ok_{key}"):
-            with engine().begin() as conn:
-                conn.execute(
-                    text(
-                        "INSERT INTO schedule (username, day, shift) VALUES (:u, :d, :s) "
-                        "ON CONFLICT (username, day) DO UPDATE SET shift = :s"
-                    ),
-                    {"u": p["username"], "d": p["day"], "s": p["requested_shift"]},
-                )
-                conn.execute(
-                    text(
-                        "UPDATE requests SET status = 'Approved', decided_by = :by "
-                        "WHERE username = :u AND day = :d"
-                    ),
-                    {"by": user["username"], "u": p["username"], "d": p["day"]},
-                )
-            st.rerun()
-        if c[6].button("Reject", key=f"no_{key}"):
-            run(
-                "UPDATE requests SET status = 'Rejected', decided_by = :by "
-                "WHERE username = :u AND day = :d",
-                by=user["username"], u=p["username"], d=p["day"],
-            )
-            st.rerun()
+    st.subheader("Recent decisions")
+    decided = rows(
+        "SELECT u.name, u.team, r.day, r.requested_shift, r.status, r.decided_at, d.name AS decided_name "
+        "FROM requests r JOIN users u ON u.username = r.username "
+        "LEFT JOIN users d ON d.username = r.decided_by "
+        f"WHERE r.status IN ('Approved', 'Rejected'){team_filter} "
+        "ORDER BY r.decided_at DESC LIMIT 100",
+        **params,
+    )
+    if not decided:
+        st.write("No decisions yet.")
+    else:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Name": d["name"],
+                        "Group": d["team"] or "",
+                        "Date": day_label(d["day"]),
+                        "Requested": d["requested_shift"],
+                        "Decision": decision_note(d["status"], d["decided_name"], d["decided_at"]),
+                    }
+                    for d in decided
+                ]
+            ),
+            hide_index=True,
+        )
 
 
 SHORT = {AM: "5AM-2PM", PM: "2PM-11PM", OFF: "OFF"}
@@ -383,6 +469,15 @@ def all_schedules_page(user):
         )
     }
 
+    approved = {
+        (r["username"], r["day"]): r["decided_name"]
+        for r in rows(
+            "SELECT r.username, r.day, d.name AS decided_name FROM requests r "
+            "JOIN users u ON u.username = r.username LEFT JOIN users d ON d.username = r.decided_by "
+            f"WHERE {where} AND r.status = 'Approved'",
+            **params,
+        )
+    }
     data = []
     for p in people:
         line = {"Name": p["name"], "Group": p["team"] or ""}
@@ -391,6 +486,8 @@ def all_schedules_page(user):
             cell = SHORT.get(sched.get((p["username"], k)), "")
             if (p["username"], k) in pend:
                 cell = f'{cell} (req: {SHORT[pend[(p["username"], k)]]})'.strip()
+            elif (p["username"], k) in approved:
+                cell = f'{cell} (approved by {approved[(p["username"], k)] or "unknown"})'.strip()
             line[d.strftime("%a %b %d")] = cell
         data.append(line)
     df = pd.DataFrame(data, columns=["Name", "Group"] + [d.strftime("%a %b %d") for d in DAYS])
@@ -401,7 +498,8 @@ def all_schedules_page(user):
         team = st.selectbox("Group", ["All groups"] + GROUPS, key="all_sched_group")
         if team != "All groups":
             df = df[df["Group"] == team]
-    st.caption("A blank cell means the day is not set. (req: ...) shows a pending change request.")
+    st.caption("A blank cell means the day is not set. (req: ...) shows a pending change request. "
+        "(approved by ...) shows who approved the change for that day.")
     st.dataframe(df, hide_index=True)
     st.download_button(
         "Download this table (CSV)", df.to_csv(index=False), file_name="all_schedules.csv", mime="text/csv"
@@ -473,7 +571,7 @@ def all_schedules_page(user):
                     "INSERT INTO requests (username, day, requested_shift, status, decided_by) "
                     "VALUES (:u, :d, :s, 'Pending', NULL) "
                     "ON CONFLICT (username, day) DO UPDATE SET "
-                    "requested_shift = :s, status = 'Pending', decided_by = NULL",
+                    "requested_shift = :s, status = 'Pending', decided_by = NULL, decided_at = NULL",
                     u=target, d=k, s=newr,
                 )
             changed += 1
@@ -711,10 +809,12 @@ def users_page(user):
         username = st.text_input("Username").strip().lower()
         password = st.text_input("Temporary password", type="password")
         role = st.selectbox("Role", ROLES)
-        team = st.selectbox("Group", GROUPS)
+        team = st.selectbox("Group", ALL_GROUPS)
         if st.form_submit_button("Add"):
             if not (name and username and password):
                 st.error("Fill in all fields.")
+            elif group_error(role, team):
+                st.error(group_error(role, team))
             elif rows("SELECT username FROM users WHERE username = :u", u=username):
                 st.error("That username is already taken.")
             else:
@@ -729,7 +829,7 @@ def users_page(user):
     st.caption(
         "Upload a CSV with the columns Name, Username, Role, Group. "
         f"Role is one of {', '.join(ROLES)} (blank means Employee). "
-        f"Group is one of {', '.join(GROUPS)}. "
+        f"Group is one of {', '.join(GROUPS)} for employees and group leaders, or HiEx for approvers and admin. "
         "Everyone in the file gets the same temporary password and must change it at first login."
     )
     st.download_button(
@@ -763,7 +863,8 @@ def users_page(user):
                             name = row["name"].strip()
                             username = row["username"].strip().lower()
                             role = row.get("role", "").strip().title() or "Employee"
-                            team = row.get("group", "").strip().upper() or None
+                            raw_team = row.get("group", "").strip()
+                            team = {g.upper(): g for g in ALL_GROUPS}.get(raw_team.upper(), raw_team) or None
                             if not name and not username:
                                 continue
                             if not name or not username:
@@ -772,10 +873,8 @@ def users_page(user):
                                 skipped.append(f"Row {line}: username {username} already exists")
                             elif role not in ROLES:
                                 skipped.append(f"Row {line}: role {row.get('role', '')} is not valid")
-                            elif team and team not in GROUPS:
-                                skipped.append(f"Row {line}: group {team} is not valid")
-                            elif role in ("Employee", "Group Leader") and not team:
-                                skipped.append(f"Row {line}: {username} needs a group")
+                            elif group_error(role, team):
+                                skipped.append(f"Row {line}: {group_error(role, team)}")
                             else:
                                 run(
                                     "INSERT INTO users (username, name, password_hash, role, team, must_change) "
@@ -799,7 +898,7 @@ def users_page(user):
     with st.form(f"edit_user_{target}"):
         new_role = st.selectbox("Role", ROLES, index=ROLES.index(by_username[target]["role"]))
         new_team = st.selectbox(
-            "Group", GROUPS, index=GROUPS.index(current_team) if current_team in GROUPS else None
+            "Group", ALL_GROUPS, index=ALL_GROUPS.index(current_team) if current_team in ALL_GROUPS else None
         )
         new_password = st.text_input("New temporary password (leave blank to keep)", type="password")
         clear = st.checkbox("Clear this user's schedule and requests")
@@ -808,6 +907,8 @@ def users_page(user):
             is_self = target == user["username"]
             if is_self and (remove or new_role != "Admin"):
                 st.error("You cannot delete yourself or remove your own Admin role.")
+            elif not remove and group_error(new_role, new_team):
+                st.error(group_error(new_role, new_team))
             else:
                 if clear or remove:
                     run("DELETE FROM schedule WHERE username = :u", u=target)
@@ -846,7 +947,7 @@ def main():
     if user["role"] in ("Approver", "Admin"):
         pages = ["Approvals", "All Schedules", "By Day", "Submissions", "Users"]
     elif user["role"] == "Group Leader":
-        pages = ["My Schedule", "All Schedules", "By Day", "Submissions"]
+        pages = ["My Schedule", "Approvals", "All Schedules", "By Day", "Submissions"]
     else:
         pages = ["My Schedule"]
     pages.append("Change Password")
