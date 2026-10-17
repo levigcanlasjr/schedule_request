@@ -101,6 +101,11 @@ def init_db():
             marked_by TEXT,
             PRIMARY KEY (username, day))"""
     )
+    try:  # adds who confirmed an attendance mark; marks made before this were made by leaders
+        run("ALTER TABLE attendance ADD COLUMN confirmed_by TEXT")
+        run("UPDATE attendance SET confirmed_by = marked_by")
+    except Exception:
+        pass
     try:  # adds the time a request was approved or rejected
         run("ALTER TABLE requests ADD COLUMN decided_at TEXT")
     except Exception:
@@ -147,6 +152,33 @@ def group_error(role, team):
     if team and team not in ALL_GROUPS:
         return f"Group {team} is not valid."
     return None
+
+
+def today_local():
+    return datetime.now(LOCAL_TZ).date()
+
+
+def load_attendance(where, params):
+    """Returns {(username, day): row} with status, marked_by, confirmed_by and the confirmer's name."""
+    return {
+        (r["username"], r["day"]): r
+        for r in rows(
+            "SELECT a.username, a.day, a.status, a.marked_by, a.confirmed_by, c.name AS confirmed_name "
+            "FROM attendance a JOIN users u ON u.username = a.username "
+            f"LEFT JOIN users c ON c.username = a.confirmed_by WHERE {where}",
+            **params,
+        )
+    }
+
+
+def attendance_label(a, owner):
+    if not a:
+        return "Not marked"
+    if a["confirmed_by"]:
+        return f'{a["status"]} (confirmed by {a["confirmed_name"] or "unknown"})'
+    if a["marked_by"] == owner:
+        return f'Self-marked: {a["status"]}'
+    return f'{a["status"]} (not confirmed)'
 
 
 def day_label(iso):
@@ -334,8 +366,59 @@ def my_schedule_page(user):
                 )
         st.rerun()
 
+    my_attendance_section(user)
+
     st.subheader("Team totals")
     show_summary()
+
+
+def my_attendance_section(user):
+    u = user["username"]
+    today = today_local()
+    days = [d for d in (today - timedelta(days=1), today) if d in DAYS]
+    st.subheader("My attendance")
+    if not days:
+        st.caption("Attendance opens on the schedule dates, for yesterday and today only.")
+        return
+    shifts = {r["day"]: r["shift"] for r in rows("SELECT day, shift FROM schedule WHERE username = :u", u=u)}
+    att = load_attendance("a.username = :u", {"u": u})
+    st.caption("Mark your attendance for yesterday and today. Your group leader or an approver will confirm it.")
+    picks = {}
+    with st.form("my_attendance"):
+        for d in days:
+            k = d.isoformat()
+            c = st.columns([2, 3, 3])
+            c[0].write(day_label(k))
+            sh = shifts.get(k)
+            if sh not in (AM, PM):
+                c[1].write(sh or "Not set")
+                c[2].caption("No shift to mark")
+                continue
+            a = att.get((u, k))
+            c[1].write(f"{sh}  \n{attendance_label(a, u)}")
+            if a and a["confirmed_by"]:
+                c[2].caption("Confirmed. Ask your group leader to change it.")
+                continue
+            cur = a["status"] if a else "Not marked"
+            picks[k] = c[2].selectbox(
+                "Attendance", ATTENDANCE, index=ATTENDANCE.index(cur),
+                key=f"self_att_{k}", label_visibility="collapsed",
+            )
+        saved = st.form_submit_button("Save my attendance")
+    if saved:
+        for k, new in picks.items():
+            a = att.get((u, k))
+            if new == "Not marked":
+                if a:
+                    run("DELETE FROM attendance WHERE username = :u AND day = :d AND confirmed_by IS NULL", u=u, d=k)
+            elif not a or a["status"] != new or a["marked_by"] != u:
+                run(
+                    "INSERT INTO attendance (username, day, status, marked_by, confirmed_by) "
+                    "VALUES (:u, :d, :s, :u, NULL) "
+                    "ON CONFLICT (username, day) DO UPDATE SET status = :s, marked_by = :u, confirmed_by = NULL",
+                    u=u, d=k, s=new,
+                )
+        st.rerun()
 
 
 def can_decide(user, request_owner, owner_team):
@@ -605,10 +688,8 @@ def by_day_page(user):
             **params,
         )
     }
-    att = {
-        (r["username"], r["day"]): r["status"]
-        for r in rows(f"SELECT a.username, a.day, a.status FROM attendance a JOIN users u ON u.username = a.username WHERE {where}", **params)
-    }
+    att_rows = load_attendance(where, params)
+    att = {key: r["status"] for key, r in att_rows.items()}
 
     groups = [user["team"]] if leader else GROUPS + (["No group"] if any(not p["team"] for p in people) else [])
     def members(g):
@@ -618,7 +699,7 @@ def by_day_page(user):
         st.caption(f'Showing your group only: {user["team"] or "no group set"}')
 
     # ---------- One day ----------
-    today = date.today()
+    today = today_local()
     default = DAYS.index(today) if today in DAYS else 0
     day = st.selectbox("Date", DAYS, index=default, format_func=lambda d: d.strftime("%a, %b %d"))
     k = day.isoformat()
@@ -639,6 +720,12 @@ def by_day_page(user):
                 on_shift = by_shift[sh]
                 marked = [att.get((p["username"], k), "Not marked") for p in on_shift]
                 tally = ", ".join(f"{m} {marked.count(m)}" for m in ATTENDANCE[1:] if marked.count(m))
+                waiting = sum(
+                    1 for p in on_shift
+                    if att_rows.get((p["username"], k)) and not att_rows[(p["username"], k)]["confirmed_by"]
+                )
+                if waiting:
+                    tally += f"{'; ' if tally else ''}{waiting} not confirmed"
                 st.markdown(f"**{sh}** ({len(on_shift)} scheduled{'; ' + tally if tally else ''})")
                 if not on_shift:
                     st.caption("No one scheduled.")
@@ -646,13 +733,24 @@ def by_day_page(user):
                     label = p["name"]
                     if (p["username"], k) in pend:
                         label += f' (req: {SHORT[pend[(p["username"], k)]]})'
-                    c = st.columns([3, 2])
+                    c = st.columns([3, 3, 2, 1])
                     c[0].write(label)
-                    cur = att.get((p["username"], k), "Not marked")
-                    picks[p["username"]] = c[1].selectbox(
+                    a = att_rows.get((p["username"], k))
+                    c[1].caption(attendance_label(a, p["username"]))
+                    cur = a["status"] if a else "Not marked"
+                    own = p["username"] == user["username"]
+                    new = c[2].selectbox(
                         "Attendance", ATTENDANCE, index=ATTENDANCE.index(cur),
                         key=f"att_{p['username']}_{k}", label_visibility="collapsed",
+                        disabled=own,
                     )
+                    ok = c[3].checkbox(
+                        "Confirm", value=bool(a and a["confirmed_by"]),
+                        key=f"conf_{p['username']}_{k}", disabled=own,
+                        help="Your own attendance is confirmed by someone else." if own else None,
+                    )
+                    if not own:
+                        picks[p["username"]] = (new, ok)
             for sh in [OFF, "Not set"]:
                 names = []
                 for p in by_shift[sh]:
@@ -663,16 +761,23 @@ def by_day_page(user):
                 st.markdown(f"**{sh}** ({len(names)}): " + (", ".join(names) if names else "none"))
             save = st.form_submit_button(f"Save attendance for {g}")
         if save:
-            for u, new in picks.items():
-                cur = att.get((u, k))
-                if new == "Not marked" and cur:
-                    run("DELETE FROM attendance WHERE username = :u AND day = :d", u=u, d=k)
-                elif new != "Not marked" and new != cur:
-                    run(
-                        "INSERT INTO attendance (username, day, status, marked_by) VALUES (:u, :d, :s, :by) "
-                        "ON CONFLICT (username, day) DO UPDATE SET status = :s, marked_by = :by",
-                        u=u, d=k, s=new, by=user["username"],
-                    )
+            for u, (new, ok) in picks.items():
+                a = att_rows.get((u, k))
+                if new == "Not marked":
+                    if a:
+                        run("DELETE FROM attendance WHERE username = :u AND day = :d", u=u, d=k)
+                    continue
+                changed = not a or a["status"] != new
+                confirm_by = user["username"] if (ok or changed) else None
+                if not changed and bool(a["confirmed_by"]) == bool(confirm_by):
+                    continue
+                run(
+                    "INSERT INTO attendance (username, day, status, marked_by, confirmed_by) "
+                    "VALUES (:u, :d, :s, :by, :c) "
+                    "ON CONFLICT (username, day) DO UPDATE SET status = :s, confirmed_by = :c"
+                    + (", marked_by = :by" if changed else ""),
+                    u=u, d=k, s=new, by=user["username"], c=confirm_by,
+                )
             st.session_state.att_msg = f"Attendance saved for {g}."
             st.rerun()
 
@@ -685,7 +790,7 @@ def by_day_page(user):
                         "Name": p["name"],
                         "Shift": sh,
                         "Pending request": pend.get((p["username"], k), ""),
-                        "Attendance": att.get((p["username"], k), "Not marked") if sh in (AM, PM) else "",
+                        "Attendance": attendance_label(att_rows.get((p["username"], k)), p["username"]) if sh in (AM, PM) else "",
                     }
                 )
     if "att_msg" in st.session_state:
@@ -699,7 +804,8 @@ def by_day_page(user):
 
     # ---------- Full view ----------
     st.subheader("Full view (all days)")
-    st.caption("Shift counts per group per day. Attendance counts people on the 5 AM and 2 PM shifts.")
+    st.caption("Shift counts per group per day. Attendance counts people on the 5 AM and 2 PM shifts. "
+        "Not confirmed counts marks that a group leader or approver has not confirmed yet.")
     full = []
     for d in DAYS:
         dk = d.isoformat()
@@ -712,6 +818,10 @@ def by_day_page(user):
                 line[SHORT.get(sh, sh)] = shifts.count(sh)
             for m in ATTENDANCE[1:] + ["Not marked"]:
                 line[m] = marks.count(m)
+            line["Not confirmed"] = sum(
+                1 for p, sh in zip(team_people, shifts)
+                if sh in (AM, PM) and att_rows.get((p["username"], dk)) and not att_rows[(p["username"], dk)]["confirmed_by"]
+            )
             full.append(line)
     full_df = pd.DataFrame(full)
     if not leader and len(groups) > 1:
