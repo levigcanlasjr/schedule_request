@@ -724,6 +724,39 @@ def by_day_page(user):
     )
 
 
+def shift_summary_page(user):
+    st.header("Shift Summary")
+    leader = user["role"] == "Group Leader"
+    params = {}
+    where = f"u.role IN {COUNTED}"
+    if leader:
+        where += " AND u.team = :t"
+        params["t"] = user["team"]
+        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+    groups = [user["team"]] if leader else GROUPS
+    counts = rows(
+        "SELECT s.day, s.shift, u.team, COUNT(*) AS n FROM schedule s "
+        f"JOIN users u ON u.username = s.username WHERE {where} GROUP BY s.day, s.shift, u.team",
+        **params,
+    )
+    n = {(r["day"], r["shift"], r["team"]): r["n"] for r in counts}
+    table = []
+    for d in DAYS:
+        k = d.isoformat()
+        line = {"Date": d.strftime("%a %b %d")}
+        for sh in SHIFTS:
+            per_group = [n.get((k, sh, g), 0) for g in groups]
+            line[f"{SHORT[sh]} Total"] = sum(n.get((k, sh, t), 0) for (dk, shk, t) in n if dk == k and shk == sh) if not leader else sum(per_group)
+            if len(groups) > 1:
+                for g, c in zip(groups, per_group):
+                    line[f"{SHORT[sh]} {g}"] = c
+        table.append(line)
+    df = pd.DataFrame(table)
+    st.caption("Number of employees and group leaders scheduled on each shift, per day. Totals include every group.")
+    st.dataframe(df, hide_index=True)
+    st.download_button("Download summary (CSV)", df.to_csv(index=False), file_name="shift_summary.csv", mime="text/csv")
+
+
 def submissions_page(user):
     st.header("Submissions")
     leader = user["role"] == "Group Leader"
@@ -945,9 +978,9 @@ def main():
         return
 
     if user["role"] in ("Approver", "Admin"):
-        pages = ["Approvals", "All Schedules", "By Day", "Submissions", "Users"]
+        pages = ["Approvals", "Shift Summary", "All Schedules", "By Day", "Submissions", "Users"]
     elif user["role"] == "Group Leader":
-        pages = ["My Schedule", "Approvals", "All Schedules", "By Day", "Submissions"]
+        pages = ["My Schedule", "Approvals", "Shift Summary", "All Schedules", "By Day", "Submissions"]
     else:
         pages = ["My Schedule"]
     pages.append("Change Password")
@@ -966,6 +999,8 @@ def main():
         approvals_page(user)
     elif page == "All Schedules":
         all_schedules_page(user)
+    elif page == "Shift Summary":
+        shift_summary_page(user)
     elif page == "By Day":
         by_day_page(user)
     elif page == "Submissions":
