@@ -837,34 +837,55 @@ def by_day_page(user):
 def shift_summary_page(user):
     st.header("Shift Summary")
     leader = user["role"] == "Group Leader"
-    params = {}
-    where = f"u.role IN {COUNTED}"
     if leader:
-        where += " AND u.team = :t"
-        params["t"] = user["team"]
-        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
-    groups = [user["team"]] if leader else GROUPS
-    counts = rows(
-        "SELECT s.day, s.shift, u.team, COUNT(*) AS n FROM schedule s "
-        f"JOIN users u ON u.username = s.username WHERE {where} GROUP BY s.day, s.shift, u.team",
-        **params,
-    )
-    n = {(r["day"], r["shift"], r["team"]): r["n"] for r in counts}
-    table = []
+        g = user["team"]
+        st.subheader(g or "No group set")
+    else:
+        g = st.selectbox("Group", GROUPS, key="sum_group")
+    params = {"t": g}
+    where = f"u.role IN {COUNTED} AND u.team = :t"
+    people = [r["username"] for r in rows(f"SELECT u.username FROM users u WHERE {where}", **params)]
+    sched = {
+        (r["username"], r["day"]): r["shift"]
+        for r in rows(f"SELECT s.username, s.day, s.shift FROM schedule s JOIN users u ON u.username = s.username WHERE {where}", **params)
+    }
+    att = load_attendance(where, params)
+    cols = [d.strftime("%b %d") for d in DAYS]
+
+    items = ["Scheduled"] + ATTENDANCE[1:] + ["Not marked", "Not confirmed"]
+    counts = {}  # (block, item) -> list of numbers per day
     for d in DAYS:
         k = d.isoformat()
-        line = {"Date": d.strftime("%a %b %d")}
-        for sh in SHIFTS:
-            per_group = [n.get((k, sh, g), 0) for g in groups]
-            line[f"{SHORT[sh]} Total"] = sum(n.get((k, sh, t), 0) for (dk, shk, t) in n if dk == k and shk == sh) if not leader else sum(per_group)
-            if len(groups) > 1:
-                for g, c in zip(groups, per_group):
-                    line[f"{SHORT[sh]} {g}"] = c
-        table.append(line)
-    df = pd.DataFrame(table)
-    st.caption("Number of employees and group leaders scheduled on each shift, per day. Totals include every group.")
-    st.dataframe(df, hide_index=True)
-    st.download_button("Download summary (CSV)", df.to_csv(index=False), file_name="shift_summary.csv", mime="text/csv")
+        shifts = {u: sched.get((u, k), "Not set") for u in people}
+        for sh in (AM, PM):
+            on = [u for u in people if shifts[u] == sh]
+            marks = [att[(u, k)]["status"] if (u, k) in att else "Not marked" for u in on]
+            values = {"Scheduled": len(on), "Not confirmed": sum(1 for u in on if (u, k) in att and not att[(u, k)]["confirmed_by"])}
+            for m in ATTENDANCE[1:] + ["Not marked"]:
+                values[m] = marks.count(m)
+            for item in items:
+                counts.setdefault((sh, item), []).append(values[item])
+        for sh in (OFF, "Not set"):
+            counts.setdefault((sh, "Scheduled" if sh == OFF else "Count"), []).append(
+                sum(1 for u in people if shifts[u] == sh)
+            )
+
+    # One block per shift: the shift name on the first row only, like a spreadsheet
+    table, last = [], None
+    for (block, item), values in counts.items():
+        table.append([block if block != last else "", item] + values)
+        last = block
+    df = pd.DataFrame(table, columns=["Shift", ""] + cols)
+
+    st.caption(
+        f"{len(people)} employees and group leaders in this group. Under each shift, Present, Late, On leave, "
+        "Absent and Not marked add up to Scheduled. Not confirmed is part of those counts."
+    )
+    st.dataframe(df, hide_index=True, height=36 * (len(df) + 1) + 4)
+    st.download_button(
+        f"Download {g} summary (CSV)", df.to_csv(index=False),
+        file_name=f"shift_summary_{g}.csv", mime="text/csv",
+    )
 
 
 def submissions_page(user):
