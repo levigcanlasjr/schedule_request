@@ -76,16 +76,11 @@ TILE_COLORS = {
     "Users": ("#3b82f6", "#1e3a8a"),
     "Change Password": ("#94a3b8", "#334155"),
 }
-TILE_CSS = "".join(
-    f""".st-key-tile_{k.replace(' ', '_')} [data-testid="stIconMaterial"] {{
-        background: linear-gradient(145deg, {c1}, {c2});
-    }}"""
-    for k, (c1, c2) in TILE_COLORS.items()
-)
 
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,500,0,0');
 html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, select {
     font-family: 'Inter', sans-serif;
 }
@@ -126,24 +121,22 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 .page-head { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px 0; }
 .page-head img { height: 34px; border-radius: 5px; }
 
-/* Icon tiles on the home page */
-[class*="st-key-tile_"] button {
-    background: transparent !important; border: none !important; box-shadow: none !important;
-    height: auto !important; padding: 6px 0 !important; width: 100%;
+/* Icon tiles on the home page: the picture is HTML, an invisible button covers it */
+[class*="st-key-tile_"] { position: relative; }
+[class*="st-key-tile_"] .stButton { position: absolute; inset: 0; z-index: 5; }
+[class*="st-key-tile_"] .stButton button {
+    width: 100%; height: 100%; opacity: 0; cursor: pointer; border: none;
 }
-[class*="st-key-tile_"] button > div, [class*="st-key-tile_"] button > span {
-    display: flex !important; flex-direction: column !important; align-items: center !important; gap: 10px !important;
-}
-[class*="st-key-tile_"] [data-testid="stIconMaterial"] {
-    font-size: 44px !important; color: #ffffff !important; width: 84px; height: 84px;
-    display: flex !important; align-items: center; justify-content: center;
-    border-radius: 22px; border: 4px solid #ffffff;
+.tile { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 10px 0 6px 0; }
+.tile-icon {
+    width: 84px; height: 84px; border-radius: 22px; border: 4px solid #ffffff;
+    display: flex; align-items: center; justify-content: center;
     box-shadow: 0 6px 16px rgba(30, 27, 75, 0.18), inset 0 2px 6px rgba(255, 255, 255, 0.35);
     transition: transform 0.15s ease;
 }
-[class*="st-key-tile_"] button:hover [data-testid="stIconMaterial"] { transform: translateY(-3px) scale(1.04); }
-[class*="st-key-tile_"] button p { font-size: 1rem; font-weight: 600; color: #1e1b4b; }
-TILE_CSS
+.tile-icon .material-symbols-rounded { font-family: 'Material Symbols Rounded'; font-size: 44px; color: #ffffff; line-height: 1; }
+[class*="st-key-tile_"]:hover .tile-icon { transform: translateY(-3px) scale(1.04); }
+.tile-label { font-size: 0.98rem; font-weight: 600; color: #1e1b4b; text-align: center; }
 
 .stButton button { border-radius: 12px; font-weight: 500; }
 .stButton button[kind="primary"], .stFormSubmitButton button[kind="primaryFormSubmit"] {
@@ -159,7 +152,7 @@ TILE_CSS
 .login-title { font-size: 1.9rem; font-weight: 800; color: #1e1b4b; text-align: center; margin-top: 1rem; }
 .login-sub { color: #6b7280; text-align: center; margin-bottom: 1rem; }
 </style>
-""".replace("LOGO_B64", LOGO_B64).replace("TILE_CSS", TILE_CSS)
+""".replace("LOGO_B64", LOGO_B64)
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -1691,11 +1684,17 @@ def home_page(user):
         for i in range(0, len(cards), per_row):
             cols = st.columns(per_row)
             for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
-                with col:
-                    st.button(
-                        title, key=f"tile_{key.replace(' ', '_')}", icon=icon, help=text,
-                        on_click=go, args=(key,), use_container_width=True,
+                slug = key.replace(" ", "_")
+                c1, c2 = TILE_COLORS.get(key, ("#60a5fa", "#1d4ed8"))
+                glyph = icon.replace(":material/", "").strip(":")
+                with col.container(key=f"tile_{slug}"):
+                    st.markdown(
+                        f'<div class="tile"><div class="tile-icon" style="background: linear-gradient(145deg, {c1}, {c2});">'
+                        f'<span class="material-symbols-rounded">{glyph}</span></div>'
+                        f'<div class="tile-label">{title}</div></div>',
+                        unsafe_allow_html=True,
                     )
+                    st.button(title, key=f"open_{slug}", help=text, on_click=go, args=(key,))
     arrivals_glimpse()
 
 
