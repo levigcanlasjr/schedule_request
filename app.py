@@ -6,7 +6,9 @@ Database:     set DATABASE_URL to your Neon connection string.
 First login:  set ADMIN_USERNAME and ADMIN_PASSWORD before the first run.
               Defaults are admin / change-me.
 """
+import base64
 import hashlib
+import io
 import hmac
 import os
 import secrets
@@ -35,8 +37,21 @@ GROUPS = ["HGT", "HPT", "HID"]  # groups that hold employees and group leaders
 ALL_GROUPS = GROUPS + ["HiEx"]  # HiEx is for approvers and admin
 LOCAL_TZ = timezone(timedelta(hours=8))
 
-APP_NAME = "Team Schedule"
-st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="collapsed")
+APP_NAME = "HIEx Volunteers"
+# Logo and icon are stored here so no extra image files are needed in the repository
+LOGO_B64 = "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"
+ICON_B64 = "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"
+
+
+def _icon_image():
+    try:
+        from PIL import Image
+        return Image.open(io.BytesIO(base64.b64decode(ICON_B64)))
+    except Exception:
+        return None
+
+
+st.set_page_config(page_title=APP_NAME, page_icon=_icon_image(), layout="wide", initial_sidebar_state="collapsed")
 
 # Arrivals run on their own date range
 ARR_START = date(2026, 10, 25)
@@ -49,35 +64,102 @@ def time_label(t):
     return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
 
 
+TILE_COLORS = {
+    "My Schedule": ("#22c1d6", "#0e7490"),
+    "Attendance": ("#a855f7", "#6d28d9"),
+    "Approvals": ("#34d399", "#047857"),
+    "Schedule": ("#fbbf24", "#b45309"),
+    "Shift Summary": ("#60a5fa", "#1d4ed8"),
+    "By Day": ("#fb923c", "#c2410c"),
+    "Submissions": ("#f472b6", "#be185d"),
+    "Arrivals": ("#38bdf8", "#0369a1"),
+    "Users": ("#3b82f6", "#1e3a8a"),
+    "Change Password": ("#94a3b8", "#334155"),
+}
+TILE_CSS = "".join(
+    f""".st-key-tile_{k.replace(' ', '_')} [data-testid="stIconMaterial"] {{
+        background: linear-gradient(145deg, {c1}, {c2});
+    }}"""
+    for k, (c1, c2) in TILE_COLORS.items()
+)
+
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, select {
     font-family: 'Inter', sans-serif;
 }
-.stApp { background: #f5f7fb; }
-#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stSidebarCollapsedControl"] { visibility: hidden; }
-.block-container { padding-top: 1.5rem; max-width: 1200px; }
-h1, h2, h3 { color: #111827; font-weight: 700; letter-spacing: -0.01em; }
-[data-testid="stVerticalBlockBorderWrapper"] {
-    background: #ffffff; border-radius: 14px; border: 1px solid #e5e7eb !important;
-    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+.stApp {
+    background: linear-gradient(135deg, #eef2fb 0%, #f7f3ef 55%, #eaf0fa 100%);
 }
-.card-title { font-size: 1.05rem; font-weight: 600; color: #111827; margin: 0.25rem 0 0.15rem 0; }
-.card-text { font-size: 0.88rem; color: #6b7280; min-height: 2.6rem; margin-bottom: 0.5rem; }
-.topbar { display: flex; align-items: center; justify-content: space-between; }
-.app-name { font-size: 1.35rem; font-weight: 700; color: #111827; }
-.who { font-size: 0.9rem; color: #6b7280; }
-.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: #eef2ff;
-        color: #4338ca; font-size: 0.78rem; font-weight: 600; margin-left: 6px; }
-.stButton button { border-radius: 10px; font-weight: 500; }
-.stButton button[kind="primary"] { background: #4f46e5; border-color: #4f46e5; }
-[data-testid="stMetric"] { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px 14px; }
-[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
-.login-title { font-size: 1.8rem; font-weight: 700; color: #111827; text-align: center; margin-top: 3rem; }
-.login-sub { color: #6b7280; text-align: center; margin-bottom: 1.2rem; }
+.stApp::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background: url("data:image/png;base64,LOGO_B64") center 55% / min(70vw, 900px) no-repeat;
+    opacity: 0.17;
+}
+.block-container { position: relative; z-index: 1; padding-top: 1.2rem; max-width: 1150px; }
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stSidebarCollapsedControl"] { visibility: hidden; }
+h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
+
+/* Glass panels */
+[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stForm"] {
+    background: rgba(255, 255, 255, 0.62) !important;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border-radius: 22px !important; border: 1px solid rgba(255, 255, 255, 0.8) !important;
+    box-shadow: 0 8px 30px rgba(30, 27, 75, 0.08);
+}
+.glass {
+    background: rgba(255, 255, 255, 0.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border-radius: 22px; border: 1px solid rgba(255, 255, 255, 0.8);
+    box-shadow: 0 8px 30px rgba(30, 27, 75, 0.08); padding: 22px 28px; margin-bottom: 18px;
+}
+.hello-date { font-size: 0.85rem; letter-spacing: 0.08em; color: #6b7280; text-transform: uppercase; }
+.hello-name { font-size: 2rem; font-weight: 800; color: #1e1b4b; margin-top: 2px; }
+
+/* Top bar */
+.topbar { display: flex; align-items: center; gap: 14px; }
+.topbar img { height: 46px; border-radius: 6px; }
+.app-name { font-size: 1.25rem; font-weight: 800; color: #1e1b4b; line-height: 1.1; }
+.who { font-size: 0.85rem; color: #6b7280; }
+.pill { display: inline-block; padding: 1px 10px; border-radius: 999px; background: #e0e7ff;
+        color: #3730a3; font-size: 0.75rem; font-weight: 600; margin-left: 6px; }
+.page-head { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px 0; }
+.page-head img { height: 34px; border-radius: 5px; }
+
+/* Icon tiles on the home page */
+[class*="st-key-tile_"] button {
+    background: transparent !important; border: none !important; box-shadow: none !important;
+    height: auto !important; padding: 6px 0 !important; width: 100%;
+}
+[class*="st-key-tile_"] button > div, [class*="st-key-tile_"] button > span {
+    display: flex !important; flex-direction: column !important; align-items: center !important; gap: 10px !important;
+}
+[class*="st-key-tile_"] [data-testid="stIconMaterial"] {
+    font-size: 44px !important; color: #ffffff !important; width: 84px; height: 84px;
+    display: flex !important; align-items: center; justify-content: center;
+    border-radius: 22px; border: 4px solid #ffffff;
+    box-shadow: 0 6px 16px rgba(30, 27, 75, 0.18), inset 0 2px 6px rgba(255, 255, 255, 0.35);
+    transition: transform 0.15s ease;
+}
+[class*="st-key-tile_"] button:hover [data-testid="stIconMaterial"] { transform: translateY(-3px) scale(1.04); }
+[class*="st-key-tile_"] button p { font-size: 1rem; font-weight: 600; color: #1e1b4b; }
+TILE_CSS
+
+.stButton button { border-radius: 12px; font-weight: 500; }
+.stButton button[kind="primary"], .stFormSubmitButton button[kind="primaryFormSubmit"] {
+    background: #1f3a8a; border-color: #1f3a8a;
+}
+[data-testid="stMetric"] {
+    background: rgba(255, 255, 255, 0.7); border: 1px solid rgba(255, 255, 255, 0.9);
+    border-radius: 16px; padding: 10px 14px;
+}
+[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+.login-logo { text-align: center; margin-top: 2.5rem; }
+.login-logo img { width: 210px; border-radius: 8px; box-shadow: 0 8px 24px rgba(31, 58, 138, 0.25); }
+.login-title { font-size: 1.9rem; font-weight: 800; color: #1e1b4b; text-align: center; margin-top: 1rem; }
+.login-sub { color: #6b7280; text-align: center; margin-bottom: 1rem; }
 </style>
-"""
+""".replace("LOGO_B64", LOGO_B64).replace("TILE_CSS", TILE_CSS)
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -292,7 +374,11 @@ def show_summary():
 def login_page():
     left, mid, right = st.columns([1, 1.2, 1])
     with mid:
-        st.markdown(f'<div class="login-title">{APP_NAME}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="login-logo"><img src="data:image/png;base64,{LOGO_B64}"></div>'
+            f'<div class="login-title">{APP_NAME}</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown('<div class="login-sub">Sign in to continue</div>', unsafe_allow_html=True)
         login_form()
 
@@ -1538,10 +1624,11 @@ def log_out():
 
 def top_bar(user, show_home):
     c = st.columns([6, 1.2, 1.2])
+    team = f' | {user["team"]}' if user.get("team") else ""
     c[0].markdown(
-        f'<div class="app-name">{APP_NAME}</div>'
-        f'<div class="who">{user["name"]}<span class="pill">{user["role"]}'
-        f'{" | " + user["team"] if user.get("team") else ""}</span></div>',
+        f'<div class="topbar"><img src="data:image/png;base64,{LOGO_B64}">'
+        f'<div><div class="app-name">{APP_NAME}</div>'
+        f'<div class="who">{user["name"]}<span class="pill">{user["role"]}{team}</span></div></div></div>',
         unsafe_allow_html=True,
     )
     if show_home:
@@ -1550,16 +1637,66 @@ def top_bar(user, show_home):
     st.write("")
 
 
+def arrivals_glimpse():
+    today = today_local()
+    day = today if today in ARR_DAYS else (ARR_DAYS[0] if today < ARR_DAYS[0] else None)
+    with st.container(border=True):
+        if day is None:
+            st.markdown("**Expected arrivals**")
+            st.caption("The arrival dates (Oct 25 to Nov 5) have ended.")
+            return
+        data = rows("SELECT * FROM arrivals WHERE day = :d ORDER BY airport_time, hotel_time", d=day.isoformat())
+        label = "today" if day == today else day.strftime("%a, %b %d")
+        st.markdown(f"**Expected arrivals {label}**")
+        m = st.columns(3)
+        m[0].metric("Delegates", sum(r["delegates"] for r in data))
+        m[1].metric("Arrival entries", len(data))
+        m[2].metric("Next airport arrival", next_arrival(data, day == today))
+        if data:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"Airport arrival": time_label(r["airport_time"]), "Hotel arrival": time_label(r["hotel_time"]), "Delegates": r["delegates"]}
+                        for r in data
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.caption("No arrivals entered for this date yet.")
+        st.button("Open Arrivals", icon=":material/flight_land:", on_click=go, args=("Arrivals",), key="glimpse_arrivals")
+
+
+def next_arrival(data, is_today):
+    if not data:
+        return "-"
+    if not is_today:
+        return time_label(data[0]["airport_time"])
+    now = datetime.now(LOCAL_TZ).strftime("%H:%M")
+    upcoming = [r for r in data if r["airport_time"] >= now]
+    return time_label(upcoming[0]["airport_time"]) if upcoming else "Done for today"
+
+
 def home_page(user):
-    st.subheader(f'Welcome, {user["name"].split()[0]}')
+    today = datetime.now(LOCAL_TZ)
+    st.markdown(
+        f'<div class="glass"><div class="hello-date">{today.strftime("%B %d, %Y")}</div>'
+        f'<div class="hello-name">Welcome, {user["name"].split()[0]}</div></div>',
+        unsafe_allow_html=True,
+    )
     cards = [c for c in CARDS if user["role"] in c[4]]
-    per_row = 3
-    for i in range(0, len(cards), per_row):
-        cols = st.columns(per_row)
-        for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
-            with col.container(border=True):
-                st.markdown(f'<div class="card-title">{title}</div><div class="card-text">{text}</div>', unsafe_allow_html=True)
-                st.button("Open", key=f"card_{key}", icon=icon, on_click=go, args=(key,), use_container_width=True)
+    per_row = 5
+    with st.container(border=True):
+        for i in range(0, len(cards), per_row):
+            cols = st.columns(per_row)
+            for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
+                with col:
+                    st.button(
+                        title, key=f"tile_{key.replace(' ', '_')}", icon=icon, help=text,
+                        on_click=go, args=(key,), use_container_width=True,
+                    )
+    arrivals_glimpse()
 
 
 def main():
