@@ -35,7 +35,50 @@ GROUPS = ["HGT", "HPT", "HID"]  # groups that hold employees and group leaders
 ALL_GROUPS = GROUPS + ["HiEx"]  # HiEx is for approvers and admin
 LOCAL_TZ = timezone(timedelta(hours=8))
 
-st.set_page_config(page_title="Schedule Change Requests", layout="wide")
+APP_NAME = "Team Schedule"
+st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="collapsed")
+
+# Arrivals run on their own date range
+ARR_START = date(2026, 10, 25)
+ARR_END = date(2026, 11, 5)
+ARR_DAYS = [ARR_START + timedelta(days=i) for i in range((ARR_END - ARR_START).days + 1)]
+TIMES = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]  # stored as 24-hour text
+
+
+def time_label(t):
+    return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
+
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, select {
+    font-family: 'Inter', sans-serif;
+}
+.stApp { background: #f5f7fb; }
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stSidebarCollapsedControl"] { visibility: hidden; }
+.block-container { padding-top: 1.5rem; max-width: 1200px; }
+h1, h2, h3 { color: #111827; font-weight: 700; letter-spacing: -0.01em; }
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #ffffff; border-radius: 14px; border: 1px solid #e5e7eb !important;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+.card-title { font-size: 1.05rem; font-weight: 600; color: #111827; margin: 0.25rem 0 0.15rem 0; }
+.card-text { font-size: 0.88rem; color: #6b7280; min-height: 2.6rem; margin-bottom: 0.5rem; }
+.topbar { display: flex; align-items: center; justify-content: space-between; }
+.app-name { font-size: 1.35rem; font-weight: 700; color: #111827; }
+.who { font-size: 0.9rem; color: #6b7280; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: #eef2ff;
+        color: #4338ca; font-size: 0.78rem; font-weight: 600; margin-left: 6px; }
+.stButton button { border-radius: 10px; font-weight: 500; }
+.stButton button[kind="primary"] { background: #4f46e5; border-color: #4f46e5; }
+[data-testid="stMetric"] { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px 14px; }
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+.login-title { font-size: 1.8rem; font-weight: 700; color: #111827; text-align: center; margin-top: 3rem; }
+.login-sub { color: #6b7280; text-align: center; margin-bottom: 1.2rem; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ---------- Database ----------
@@ -100,6 +143,16 @@ def init_db():
             status TEXT NOT NULL,
             marked_by TEXT,
             PRIMARY KEY (username, day))"""
+    )
+    run(
+        """CREATE TABLE IF NOT EXISTS arrivals (
+            id TEXT PRIMARY KEY,
+            day TEXT NOT NULL,
+            airport_time TEXT NOT NULL,
+            hotel_time TEXT NOT NULL,
+            delegates INTEGER NOT NULL,
+            entered_by TEXT,
+            entered_at TEXT)"""
     )
     try:  # adds who confirmed an attendance mark; marks made before this were made by leaders
         run("ALTER TABLE attendance ADD COLUMN confirmed_by TEXT")
@@ -237,11 +290,18 @@ def show_summary():
 
 # ---------- Pages ----------
 def login_page():
-    st.title("Schedule Change Requests")
-    with st.form("login"):
+    left, mid, right = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown(f'<div class="login-title">{APP_NAME}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-sub">Sign in to continue</div>', unsafe_allow_html=True)
+        login_form()
+
+
+def login_form():
+    with st.form("login", border=True):
         username = st.text_input("Username").strip().lower()
         password = st.text_input("Password", type="password")
-        if st.form_submit_button("Log in"):
+        if st.form_submit_button("Log in", type="primary", use_container_width=True):
             found = rows("SELECT * FROM users WHERE lower(username) = :u", u=username)
             if found and check_password(password, found[0]["password_hash"]):
                 st.session_state.user = {
@@ -365,8 +425,6 @@ def my_schedule_page(user):
                     u=u, d=k, s=choice,
                 )
         st.rerun()
-
-    my_attendance_section(user)
 
     st.subheader("Team totals")
     show_summary()
@@ -539,7 +597,7 @@ SHORT = {AM: "5AM-2PM", PM: "2PM-11PM", OFF: "OFF"}
 
 
 def all_schedules_page(user):
-    st.header("All Schedules")
+    st.header("Schedule")
     leader = user["role"] == "Group Leader"
     params = {}
     where = f"u.role IN {COUNTED}"
@@ -571,29 +629,48 @@ def all_schedules_page(user):
     }
     data = []
     for p in people:
-        line = {"Name": p["name"], "Group": p["team"] or ""}
         for d in DAYS:
             k = d.isoformat()
-            cell = SHORT.get(sched.get((p["username"], k)), "")
+            note = ""
             if (p["username"], k) in pend:
-                cell = f'{cell} (req: {SHORT[pend[(p["username"], k)]]})'.strip()
+                note = f'Pending request: {pend[(p["username"], k)]}'
             elif (p["username"], k) in approved:
-                cell = f'{cell} (approved by {approved[(p["username"], k)] or "unknown"})'.strip()
-            line[d.strftime("%a %b %d")] = cell
-        data.append(line)
-    df = pd.DataFrame(data, columns=["Name", "Group"] + [d.strftime("%a %b %d") for d in DAYS])
+                note = f'Change approved by {approved[(p["username"], k)] or "unknown"}'
+            data.append(
+                {
+                    "Date": d,
+                    "Employee": p["name"],
+                    "Shift": sched.get((p["username"], k), "Not set"),
+                    "Group": p["team"] or "",
+                    "Note": note,
+                }
+            )
+    df = pd.DataFrame(data, columns=["Date", "Employee", "Shift", "Group", "Note"])
 
+    f = st.columns(3)
     if leader:
-        st.caption(f'Showing your group only: {user["team"] or "no group set"}')
+        f[0].text_input("Group", value=user["team"] or "No group", disabled=True)
     else:
-        team = st.selectbox("Group", ["All groups"] + GROUPS, key="all_sched_group")
+        team = f[0].selectbox("Group", ["All groups"] + GROUPS, key="all_sched_group")
         if team != "All groups":
             df = df[df["Group"] == team]
-    st.caption("A blank cell means the day is not set. (req: ...) shows a pending change request. "
-        "(approved by ...) shows who approved the change for that day.")
-    st.dataframe(df, hide_index=True)
+    day_pick = f[1].selectbox(
+        "Date", ["All dates"] + DAYS, key="sched_day",
+        format_func=lambda d: d if isinstance(d, str) else d.strftime("%a, %b %d"),
+    )
+    if day_pick != "All dates":
+        df = df[df["Date"] == day_pick]
+    shift_pick = f[2].selectbox("Shift", ["All shifts"] + SHIFTS + ["Not set"], key="sched_shift")
+    if shift_pick != "All shifts":
+        df = df[df["Shift"] == shift_pick]
+
+    order = {g: i for i, g in enumerate(ALL_GROUPS)}
+    df = df.assign(_g=df["Group"].map(lambda g: order.get(g, 99))).sort_values(["_g", "Date", "Employee"]).drop(columns="_g")
+    df["Date"] = df["Date"].map(lambda d: d.strftime("%a, %b %d"))
+    st.caption(f"{len(df)} rows. Sorted by group, then date, then employee.")
+    st.dataframe(df, hide_index=True, use_container_width=True)
     st.download_button(
-        "Download this table (CSV)", df.to_csv(index=False), file_name="all_schedules.csv", mime="text/csv"
+        "Download this table (CSV)", df.to_csv(index=False), file_name="schedule.csv", mime="text/csv"
     )
 
     if user["role"] != "Admin" or not people:
@@ -846,53 +923,375 @@ def shift_summary_page(user):
     leader = user["role"] == "Group Leader"
     if leader:
         g = user["team"]
-        st.subheader(g or "No group set")
+        st.caption(f'Showing your group only: {g or "no group set"}')
     else:
-        g = st.selectbox("Group", GROUPS, key="sum_group")
-    params = {"t": g}
-    where = f"u.role IN {COUNTED} AND u.team = :t"
+        g = st.selectbox("Group", ["All groups"] + GROUPS, key="sum_group")
+    params, where = {}, f"u.role IN {COUNTED}"
+    if g != "All groups":
+        where += " AND u.team = :t"
+        params["t"] = g
     people = [r["username"] for r in rows(f"SELECT u.username FROM users u WHERE {where}", **params)]
     sched = {
         (r["username"], r["day"]): r["shift"]
         for r in rows(f"SELECT s.username, s.day, s.shift FROM schedule s JOIN users u ON u.username = s.username WHERE {where}", **params)
     }
     att = load_attendance(where, params)
-    cols = [d.strftime("%b %d") for d in DAYS]
 
-    items = ["Scheduled"] + ATTENDANCE[1:] + ["Not marked", "Not confirmed"]
-    counts = {}  # (block, item) -> list of numbers per day
+    statuses = ATTENDANCE[1:] + ["Not marked"]
+    table = []
     for d in DAYS:
         k = d.isoformat()
         shifts = {u: sched.get((u, k), "Not set") for u in people}
         for sh in (AM, PM):
             on = [u for u in people if shifts[u] == sh]
             marks = [att[(u, k)]["status"] if (u, k) in att else "Not marked" for u in on]
-            values = {"Scheduled": len(on), "Not confirmed": sum(1 for u in on if (u, k) in att and not att[(u, k)]["confirmed_by"])}
-            for m in ATTENDANCE[1:] + ["Not marked"]:
-                values[m] = marks.count(m)
-            for item in items:
-                counts.setdefault((sh, item), []).append(values[item])
+            line = {"Date": d.strftime("%a, %b %d"), "Shift": sh, "Scheduled": len(on)}
+            for m in statuses:
+                line[m] = marks.count(m)
+            line["Not confirmed"] = sum(1 for u in on if (u, k) in att and not att[(u, k)]["confirmed_by"])
+            table.append(line)
         for sh in (OFF, "Not set"):
-            counts.setdefault((sh, "Scheduled" if sh == OFF else "Count"), []).append(
-                sum(1 for u in people if shifts[u] == sh)
-            )
+            table.append({"Date": d.strftime("%a, %b %d"), "Shift": sh, "Scheduled": sum(1 for u in people if shifts[u] == sh)})
+    cols = ["Date", "Shift", "Scheduled"] + statuses + ["Not confirmed"]
+    df = pd.DataFrame(table, columns=cols)
+    for c in statuses + ["Not confirmed"]:
+        df[c] = df[c].astype("Int64")
 
-    # One block per shift: the shift name on the first row only, like a spreadsheet
-    table, last = [], None
-    for (block, item), values in counts.items():
-        table.append([block if block != last else "", item] + values)
-        last = block
-    df = pd.DataFrame(table, columns=["Shift", ""] + cols)
-
+    day_pick = st.selectbox(
+        "Date", ["All dates"] + [d.strftime("%a, %b %d") for d in DAYS], key="sum_day",
+    )
+    if day_pick != "All dates":
+        df = df[df["Date"] == day_pick]
     st.caption(
-        f"{len(people)} employees and group leaders in this group. Under each shift, Present, Late, On leave, "
-        "Absent and Not marked add up to Scheduled. Not confirmed is part of those counts."
+        f"{len(people)} employees and group leaders. Present, Late, Absent, On leave and Not marked add up to "
+        "Scheduled for each shift. Not confirmed is part of those counts. Attendance is blank for OFF and Not set."
     )
-    st.dataframe(df, hide_index=True, height=36 * (len(df) + 1) + 4)
+    st.dataframe(df, hide_index=True, use_container_width=True)
     st.download_button(
-        f"Download {g} summary (CSV)", df.to_csv(index=False),
-        file_name=f"shift_summary_{g}.csv", mime="text/csv",
+        "Download summary (CSV)", df.to_csv(index=False),
+        file_name=f"shift_summary_{g}.csv".replace(" ", "_"), mime="text/csv",
     )
+
+
+REVIEWERS = ("Group Leader", "Approver", "Admin")
+
+
+def attendance_page(user):
+    st.header("Attendance")
+    if user["role"] in ("Employee", "Group Leader"):
+        with st.container(border=True):
+            my_attendance_section(user)
+    if user["role"] in REVIEWERS:
+        with st.container(border=True):
+            attendance_review(user)
+
+
+def attendance_review(user):
+    st.subheader("Team attendance")
+    leader = user["role"] == "Group Leader"
+    f = st.columns(2)
+    today = today_local()
+    day = f[0].selectbox(
+        "Date", DAYS, index=DAYS.index(today) if today in DAYS else 0,
+        format_func=lambda d: d.strftime("%a, %b %d"), key="att_rev_day",
+    )
+    if leader:
+        team = user["team"]
+        f[1].text_input("Group", value=team or "No group", disabled=True)
+    else:
+        team = f[1].selectbox("Group", ["All groups"] + GROUPS, key="att_rev_group")
+    k = day.isoformat()
+
+    params, where = {}, f"u.role IN {COUNTED}"
+    if team != "All groups":
+        where += " AND u.team = :t"
+        params["t"] = team
+    people = rows(f"SELECT u.username, u.name, u.team FROM users u WHERE {where} ORDER BY u.team, u.name", **params)
+    shifts = {
+        r["username"]: r["shift"]
+        for r in rows(
+            f"SELECT s.username, s.shift FROM schedule s JOIN users u ON u.username = s.username WHERE {where} AND s.day = :d",
+            d=k, **params,
+        )
+    }
+    att = load_attendance(where + " AND a.day = :d", dict(params, d=k))
+
+    # Overview per group
+    overview = []
+    for g in sorted({p["team"] or "No group" for p in people}, key=lambda x: ALL_GROUPS.index(x) if x in ALL_GROUPS else 99):
+        on = [p["username"] for p in people if (p["team"] or "No group") == g and shifts.get(p["username"]) in (AM, PM)]
+        marks = [att[(u, k)]["status"] if (u, k) in att else "Not marked" for u in on]
+        line = {"Group": g, "Scheduled": len(on)}
+        for m in ATTENDANCE[1:] + ["Not marked"]:
+            line[m] = marks.count(m)
+        line["Not confirmed"] = sum(1 for u in on if (u, k) in att and not att[(u, k)]["confirmed_by"])
+        overview.append(line)
+    if overview:
+        ov = pd.DataFrame(overview)
+        if len(ov) > 1:
+            total = ov.drop(columns="Group").sum()
+            ov = pd.concat([ov, pd.DataFrame([{"Group": "Overall", **total.to_dict()}])], ignore_index=True)
+        st.dataframe(ov, hide_index=True, use_container_width=True)
+
+    working = [p for p in people if shifts.get(p["username"]) in (AM, PM)]
+    if not working:
+        st.info("No one is on the 5 AM or 2 PM shift for this date.")
+        return
+    st.caption("Change a status or tick Confirm, then click Save. Changing a status also confirms it.")
+    base = pd.DataFrame(
+        [
+            {
+                "username": p["username"],
+                "Name": p["name"],
+                "Group": p["team"] or "",
+                "Shift": shifts[p["username"]],
+                "Current": attendance_label(att.get((p["username"], k)), p["username"]),
+                "Status": att[(p["username"], k)]["status"] if (p["username"], k) in att else "Not marked",
+                "Confirm": bool(att.get((p["username"], k)) and att[(p["username"], k)]["confirmed_by"]),
+            }
+            for p in working
+        ]
+    )
+    edited = st.data_editor(
+        base,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["username", "Name", "Group", "Shift", "Current"],
+        column_config={
+            "username": None,
+            "Status": st.column_config.SelectboxColumn("Status", options=ATTENDANCE, required=True),
+            "Confirm": st.column_config.CheckboxColumn("Confirm"),
+        },
+        key=f"att_editor_{k}_{team}",
+    )
+    if st.button("Save attendance", type="primary"):
+        saved = 0
+        for _, r in edited.iterrows():
+            u, new, ok = r["username"], r["Status"], bool(r["Confirm"])
+            a = att.get((u, k))
+            if new == "Not marked":
+                if a:
+                    run("DELETE FROM attendance WHERE username = :u AND day = :d", u=u, d=k)
+                    saved += 1
+                continue
+            changed = not a or a["status"] != new
+            confirm_by = user["username"] if (ok or changed) else None
+            if not changed and bool(a["confirmed_by"]) == bool(confirm_by):
+                continue
+            run(
+                "INSERT INTO attendance (username, day, status, marked_by, confirmed_by) "
+                "VALUES (:u, :d, :s, :by, :c) "
+                "ON CONFLICT (username, day) DO UPDATE SET status = :s, confirmed_by = :c"
+                + (", marked_by = :by" if changed else ""),
+                u=u, d=k, s=new, by=user["username"], c=confirm_by,
+            )
+            saved += 1
+        st.session_state.att_rev_msg = f"Saved {saved} change(s)."
+        st.rerun()
+    if "att_rev_msg" in st.session_state:
+        st.success(st.session_state.pop("att_rev_msg"))
+
+
+ARR_EDITORS = ("Group Leader", "Approver", "Admin")
+
+
+def parse_time(value):
+    """Accepts 1:30 PM, 01:30 PM, 13:30. Returns HH:MM on the 30-minute grid, or None."""
+    value = str(value).strip().upper()
+    for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M", "%H:%M:%S", "%I %p"):
+        try:
+            t = datetime.strptime(value, fmt).strftime("%H:%M")
+            return t if t in TIMES else None
+        except ValueError:
+            continue
+    return None
+
+
+def arrivals_page(user):
+    st.header("Arrivals")
+    data = rows("SELECT * FROM arrivals ORDER BY day, airport_time, hotel_time")
+    today = today_local()
+
+    f = st.columns([2, 3])
+    day = f[0].selectbox(
+        "Date", ARR_DAYS, index=ARR_DAYS.index(today) if today in ARR_DAYS else 0,
+        format_func=lambda d: d.strftime("%a, %b %d"), key="arr_day",
+    )
+    k = day.isoformat()
+    day_rows = [r for r in data if r["day"] == k]
+    m = st.columns(3)
+    m[0].metric("Delegates", sum(r["delegates"] for r in day_rows))
+    m[1].metric("Arrival entries", len(day_rows))
+    m[2].metric(
+        "First airport arrival", time_label(day_rows[0]["airport_time"]) if day_rows else "-"
+    )
+
+    if day_rows:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Airport arrival": time_label(r["airport_time"]),
+                        "Hotel arrival": time_label(r["hotel_time"]),
+                        "Delegates": r["delegates"],
+                    }
+                    for r in day_rows
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No arrivals entered for this date.")
+
+    with st.expander("All dates"):
+        totals = []
+        for d in ARR_DAYS:
+            dr = [r for r in data if r["day"] == d.isoformat()]
+            totals.append({"Date": d.strftime("%a, %b %d"), "Entries": len(dr), "Delegates": sum(r["delegates"] for r in dr)})
+        tot_df = pd.DataFrame(totals)
+        st.dataframe(tot_df, hide_index=True, use_container_width=True)
+        all_df = pd.DataFrame(
+            [
+                {
+                    "Date": day_label(r["day"]),
+                    "Airport arrival": time_label(r["airport_time"]),
+                    "Hotel arrival": time_label(r["hotel_time"]),
+                    "Delegates": r["delegates"],
+                }
+                for r in data
+            ],
+            columns=["Date", "Airport arrival", "Hotel arrival", "Delegates"],
+        )
+        st.download_button("Download all arrivals (CSV)", all_df.to_csv(index=False), file_name="arrivals.csv", mime="text/csv")
+
+    if user["role"] not in ARR_EDITORS:
+        return
+
+    st.divider()
+    st.subheader("Manage arrivals")
+    t1, t2, t3 = st.tabs(["Add entry", "Edit or delete", "Bulk upload"])
+
+    with t1:
+        with st.form("arr_add", clear_on_submit=True):
+            c = st.columns(4)
+            a_day = c[0].selectbox("Date", ARR_DAYS, index=ARR_DAYS.index(day), format_func=lambda d: d.strftime("%a, %b %d"))
+            a_air = c[1].selectbox("Expected airport arrival", TIMES, format_func=time_label)
+            a_hot = c[2].selectbox("Expected hotel arrival", TIMES, format_func=time_label)
+            a_del = c[3].number_input("Delegates", min_value=1, step=1, value=1)
+            if st.form_submit_button("Add arrival", type="primary"):
+                run(
+                    "INSERT INTO arrivals (id, day, airport_time, hotel_time, delegates, entered_by, entered_at) "
+                    "VALUES (:i, :d, :a, :h, :n, :by, :at)",
+                    i=secrets.token_hex(8), d=a_day.isoformat(), a=a_air, h=a_hot, n=int(a_del),
+                    by=user["username"], at=now_local(),
+                )
+                st.session_state.arr_msg = "Arrival added."
+                st.rerun()
+
+    with t2:
+        if not day_rows:
+            st.caption("No entries on the selected date.")
+        else:
+            st.caption("Entries for the date selected at the top. Edit the cells or tick Delete, then click Save.")
+            base = pd.DataFrame(
+                [
+                    {
+                        "id": r["id"],
+                        "Airport arrival": time_label(r["airport_time"]),
+                        "Hotel arrival": time_label(r["hotel_time"]),
+                        "Delegates": r["delegates"],
+                        "Delete": False,
+                    }
+                    for r in day_rows
+                ]
+            )
+            labels = [time_label(t) for t in TIMES]
+            edited = st.data_editor(
+                base,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "id": None,
+                    "Airport arrival": st.column_config.SelectboxColumn(options=labels, required=True),
+                    "Hotel arrival": st.column_config.SelectboxColumn(options=labels, required=True),
+                    "Delegates": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+                    "Delete": st.column_config.CheckboxColumn(),
+                },
+                key=f"arr_edit_{k}",
+            )
+            if st.button("Save changes", type="primary", key="arr_save"):
+                back = {time_label(t): t for t in TIMES}
+                for _, r in edited.iterrows():
+                    if r["Delete"]:
+                        run("DELETE FROM arrivals WHERE id = :i", i=r["id"])
+                    else:
+                        run(
+                            "UPDATE arrivals SET airport_time = :a, hotel_time = :h, delegates = :n WHERE id = :i",
+                            a=back[r["Airport arrival"]], h=back[r["Hotel arrival"]], n=int(r["Delegates"]), i=r["id"],
+                        )
+                st.session_state.arr_msg = "Changes saved."
+                st.rerun()
+
+    with t3:
+        st.caption(
+            "Upload a CSV with the columns Date, Airport Arrival, Hotel Arrival, Delegates. "
+            "Dates must be between Oct 25 and Nov 5. Times are on the half hour, for example 1:30 PM or 13:30."
+        )
+        st.download_button(
+            "Download CSV template",
+            "Date,Airport Arrival,Hotel Arrival,Delegates\n2026-10-25,9:00 AM,10:30 AM,12\n",
+            file_name="arrivals_template.csv", mime="text/csv",
+        )
+        with st.form("arr_bulk", clear_on_submit=True):
+            up = st.file_uploader("CSV file", type="csv")
+            if st.form_submit_button("Upload arrivals", type="primary"):
+                if up is None:
+                    st.error("Choose a CSV file.")
+                else:
+                    try:
+                        df = pd.read_csv(up, dtype=str, encoding="utf-8-sig").fillna("")
+                        df.columns = [str(c).strip().lower() for c in df.columns]
+                    except Exception:
+                        df = None
+                    need = {"date", "airport arrival", "hotel arrival", "delegates"}
+                    if df is None or not need <= set(df.columns):
+                        st.error("Could not read the file. It needs Date, Airport Arrival, Hotel Arrival, Delegates.")
+                    else:
+                        added, skipped = 0, []
+                        for i, r in df.iterrows():
+                            line = i + 2
+                            try:
+                                d = pd.to_datetime(r["date"]).date()
+                            except Exception:
+                                d = None
+                            air, hot = parse_time(r["airport arrival"]), parse_time(r["hotel arrival"])
+                            try:
+                                n = int(float(r["delegates"]))
+                            except ValueError:
+                                n = 0
+                            if d not in ARR_DAYS:
+                                skipped.append(f"Row {line}: date {r['date']} is not between Oct 25 and Nov 5")
+                            elif not air or not hot:
+                                skipped.append(f"Row {line}: a time is not valid or not on the half hour")
+                            elif n < 1:
+                                skipped.append(f"Row {line}: delegates must be 1 or more")
+                            else:
+                                run(
+                                    "INSERT INTO arrivals (id, day, airport_time, hotel_time, delegates, entered_by, entered_at) "
+                                    "VALUES (:i, :d, :a, :h, :n, :by, :at)",
+                                    i=secrets.token_hex(8), d=d.isoformat(), a=air, h=hot, n=n,
+                                    by=user["username"], at=now_local(),
+                                )
+                                added += 1
+                        msg = f"Added {added} arrival(s)."
+                        if skipped:
+                            msg += "  \nSkipped:  \n" + "  \n".join(skipped)
+                        st.session_state.arr_msg = msg
+                        st.rerun()
+
+    if "arr_msg" in st.session_state:
+        st.success(st.session_state.pop("arr_msg"))
 
 
 def submissions_page(user):
@@ -1101,6 +1500,68 @@ def users_page(user):
 
 
 # ---------- Main ----------
+CARDS = [
+    # key, title, description, icon, roles
+    ("My Schedule", "My Schedule", "Set your shifts and request changes.", ":material/edit_calendar:", ("Employee", "Group Leader")),
+    ("Attendance", "Attendance", "Mark your attendance and confirm your team's.", ":material/how_to_reg:", ("Employee", "Group Leader", "Approver", "Admin")),
+    ("Approvals", "Approvals", "Review and decide change requests.", ":material/task_alt:", ("Group Leader", "Approver", "Admin")),
+    ("Schedule", "Schedule", "Everyone's shifts by group, date and employee.", ":material/calendar_month:", ("Group Leader", "Approver", "Admin")),
+    ("Shift Summary", "Shift Summary", "Scheduled and attendance counts per date and shift.", ":material/table_chart:", ("Group Leader", "Approver", "Admin")),
+    ("By Day", "By Day", "Who is on each shift for one day.", ":material/today:", ("Group Leader", "Approver", "Admin")),
+    ("Submissions", "Submissions", "Who has and has not set their schedule.", ":material/fact_check:", ("Group Leader", "Approver", "Admin")),
+    ("Arrivals", "Arrivals", "Expected airport and hotel arrivals of delegates.", ":material/flight_land:", ("Employee", "Group Leader", "Approver", "Admin")),
+    ("Users", "Users", "Add, edit and upload users.", ":material/group:", ("Approver", "Admin")),
+    ("Change Password", "Change Password", "Update your password.", ":material/lock:", ("Employee", "Group Leader", "Approver", "Admin")),
+]
+PAGES = {
+    "My Schedule": my_schedule_page,
+    "Attendance": attendance_page,
+    "Approvals": approvals_page,
+    "Schedule": all_schedules_page,
+    "Shift Summary": shift_summary_page,
+    "By Day": by_day_page,
+    "Submissions": submissions_page,
+    "Arrivals": arrivals_page,
+    "Users": users_page,
+    "Change Password": change_password_page,
+}
+
+
+def go(page):
+    st.session_state.page = page
+
+
+def log_out():
+    st.session_state.pop("user", None)
+    st.session_state.page = "Home"
+
+
+def top_bar(user, show_home):
+    c = st.columns([6, 1.2, 1.2])
+    c[0].markdown(
+        f'<div class="app-name">{APP_NAME}</div>'
+        f'<div class="who">{user["name"]}<span class="pill">{user["role"]}'
+        f'{" | " + user["team"] if user.get("team") else ""}</span></div>',
+        unsafe_allow_html=True,
+    )
+    if show_home:
+        c[1].button("Home", icon=":material/home:", on_click=go, args=("Home",), use_container_width=True)
+    c[2].button("Log out", icon=":material/logout:", on_click=log_out, use_container_width=True)
+    st.write("")
+
+
+def home_page(user):
+    st.subheader(f'Welcome, {user["name"].split()[0]}')
+    cards = [c for c in CARDS if user["role"] in c[4]]
+    per_row = 3
+    for i in range(0, len(cards), per_row):
+        cols = st.columns(per_row)
+        for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
+            with col.container(border=True):
+                st.markdown(f'<div class="card-title">{title}</div><div class="card-text">{text}</div>', unsafe_allow_html=True)
+                st.button("Open", key=f"card_{key}", icon=icon, on_click=go, args=(key,), use_container_width=True)
+
+
 def main():
     init_db()
     user = st.session_state.get("user")
@@ -1109,44 +1570,19 @@ def main():
         return
 
     if user.get("must_change"):
+        top_bar(user, show_home=False)
         change_password_page(user, forced=True)
-        if st.button("Log out"):
-            del st.session_state["user"]
-            st.rerun()
         return
 
-    if user["role"] in ("Approver", "Admin"):
-        pages = ["Approvals", "Shift Summary", "All Schedules", "By Day", "Submissions", "Users"]
-    elif user["role"] == "Group Leader":
-        pages = ["My Schedule", "Approvals", "Shift Summary", "All Schedules", "By Day", "Submissions"]
+    page = st.session_state.get("page", "Home")
+    allowed = {c[0] for c in CARDS if user["role"] in c[4]}
+    if page != "Home" and page not in allowed:
+        page = "Home"
+    top_bar(user, show_home=page != "Home")
+    if page == "Home":
+        home_page(user)
     else:
-        pages = ["My Schedule"]
-    pages.append("Change Password")
-
-    with st.sidebar:
-        st.write(f'**{user["name"]}**')
-        st.caption(user["role"])
-        page = st.radio("Menu", pages)
-        if st.button("Log out"):
-            del st.session_state["user"]
-            st.rerun()
-
-    if page == "My Schedule":
-        my_schedule_page(user)
-    elif page == "Approvals":
-        approvals_page(user)
-    elif page == "All Schedules":
-        all_schedules_page(user)
-    elif page == "Shift Summary":
-        shift_summary_page(user)
-    elif page == "By Day":
-        by_day_page(user)
-    elif page == "Submissions":
-        submissions_page(user)
-    elif page == "Change Password":
-        change_password_page(user)
-    else:
-        users_page(user)
+        PAGES[page](user)
 
 
 main()
