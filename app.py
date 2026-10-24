@@ -64,6 +64,11 @@ def time_label(t):
     return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
 
 
+TILE_GLYPHS = {
+    "My Schedule": "edit_calendar", "Attendance": "how_to_reg", "Approvals": "task_alt",
+    "Schedule": "calendar_month", "Shift Summary": "table_chart", "By Day": "today",
+    "Submissions": "fact_check", "Arrivals": "flight_land", "Users": "group", "Change Password": "lock",
+}
 TILE_COLORS = {
     "My Schedule": ("#22c1d6", "#0e7490"),
     "Attendance": ("#a855f7", "#6d28d9"),
@@ -77,6 +82,12 @@ TILE_COLORS = {
     "Change Password": ("#94a3b8", "#334155"),
 }
 
+TILE_CSS = "".join(
+    f'.st-key-open_{k.replace(" ", "_")} button::before {{ content: "{TILE_GLYPHS[k]}"; '
+    f"background: linear-gradient(145deg, {c1}, {c2}); }}"
+    for k, (c1, c2) in TILE_COLORS.items()
+)
+
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
@@ -87,26 +98,27 @@ html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, sele
 .stApp {
     background: linear-gradient(135deg, #eef2fb 0%, #f7f3ef 55%, #eaf0fa 100%);
 }
-.stApp::before {
-    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
-    background: url("data:image/png;base64,LOGO_B64") center 55% / min(70vw, 900px) no-repeat;
-    opacity: 0.17;
-}
 .block-container { position: relative; z-index: 1; padding-top: 1.5rem !important; max-width: 1150px; }
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stSidebarCollapsedControl"] { visibility: hidden; }
 header[data-testid="stHeader"], [data-testid="stDecoration"] { display: none !important; }
+[data-testid="stHeaderActionElements"], .stMarkdown a.anchor-link { display: none !important; }
+.stApp, .stMarkdown, p, label, .stCaption { color: #111827; }
+[data-testid="stCaptionContainer"] { color: #4b5563 !important; }
+.st-key-topbar [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: center !important; }
+.st-key-topbar [data-testid="stColumn"]:first-child { flex: 1 1 auto !important; min-width: 0 !important; }
+.st-key-topbar [data-testid="stColumn"]:not(:first-child) { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; }
 h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 
 /* Glass panels */
 [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stForm"] {
-    background: rgba(255, 255, 255, 0.62) !important;
+    background: rgba(255, 255, 255, 0.92) !important;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    border-radius: 22px !important; border: 1px solid rgba(255, 255, 255, 0.8) !important;
+    border-radius: 22px !important; border: 1px solid #e5e7eb !important;
     box-shadow: 0 8px 30px rgba(30, 27, 75, 0.08);
 }
 .glass {
-    background: rgba(255, 255, 255, 0.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    border-radius: 22px; border: 1px solid rgba(255, 255, 255, 0.8);
+    background: rgba(255, 255, 255, 0.92); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border-radius: 22px; border: 1px solid #e5e7eb;
     box-shadow: 0 8px 30px rgba(30, 27, 75, 0.08); padding: 22px 28px; margin-bottom: 18px;
 }
 .hello-date { font-size: 0.85rem; letter-spacing: 0.08em; color: #6b7280; text-transform: uppercase; }
@@ -122,24 +134,25 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 .page-head { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px 0; }
 .page-head img { height: 34px; border-radius: 5px; }
 
-/* Icon tiles on the home page. The icon is a picture; the button under it shows the
-   name and is pulled up over the icon so the whole tile is clickable. */
-.tile { display: flex; justify-content: center; padding-top: 10px; pointer-events: none; }
-.tile-icon {
-    width: 84px; height: 84px; border-radius: 22px; border: 4px solid #ffffff;
-    display: flex; align-items: center; justify-content: center;
+/* Icon tiles on the home page. The icon is drawn on the button itself (::before),
+   so clicking the icon or the name opens the page. */
+[class*="st-key-open_"] button {
+    display: flex !important; flex-direction: column !important; align-items: center !important;
+    justify-content: flex-start !important; gap: 10px; width: 100% !important;
+    background: transparent !important; border: none !important; box-shadow: none !important;
+    padding: 8px 4px !important; min-height: 140px; cursor: pointer;
+}
+[class*="st-key-open_"] button::before {
+    font-family: 'Material Symbols Rounded'; font-feature-settings: 'liga'; font-size: 44px; line-height: 1;
+    color: #ffffff; width: 84px; height: 84px; min-height: 84px; border-radius: 22px; border: 4px solid #ffffff;
+    display: flex; align-items: center; justify-content: center; box-sizing: border-box;
     box-shadow: 0 6px 16px rgba(30, 27, 75, 0.18), inset 0 2px 6px rgba(255, 255, 255, 0.35);
     transition: transform 0.15s ease;
 }
-.tile-icon .material-symbols-rounded { font-family: 'Material Symbols Rounded'; font-size: 44px; color: #ffffff; line-height: 1; }
-[class*="st-key-tile_"]:hover .tile-icon { transform: translateY(-3px) scale(1.04); }
-[class*="st-key-tile_"] .stButton button {
-    width: 100% !important; background: transparent !important; border: none !important; box-shadow: none !important;
-    margin-top: -112px !important; padding-top: 100px !important; min-height: 136px !important;
-    position: relative; z-index: 3; cursor: pointer;
-}
-[class*="st-key-tile_"] .stButton button:focus, [class*="st-key-tile_"] .stButton button:active { outline: none !important; }
-[class*="st-key-tile_"] .stButton button p { font-size: 0.98rem; font-weight: 600; color: #1e1b4b; }
+[class*="st-key-open_"] button:hover::before { transform: translateY(-3px) scale(1.04); }
+[class*="st-key-open_"] button:focus, [class*="st-key-open_"] button:active { outline: none !important; }
+[class*="st-key-open_"] button p { font-size: 0.98rem; font-weight: 600; color: #1e1b4b; text-align: center; margin: 0; }
+TILE_CSS
 
 /* Phones: tiles in rows of 3, smaller icons */
 @media (max-width: 640px) {
@@ -147,10 +160,13 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
     .st-key-tiles [data-testid="stColumn"], .st-key-tiles [data-testid="column"] {
         width: calc(33.3% - 0.5rem) !important; flex: 0 0 calc(33.3% - 0.5rem) !important; min-width: calc(33.3% - 0.5rem) !important;
     }
-    .tile-icon { width: 64px; height: 64px; border-radius: 18px; }
-    .tile-icon .material-symbols-rounded { font-size: 34px; }
-    [class*="st-key-tile_"] .stButton button { margin-top: -90px !important; padding-top: 80px !important; min-height: 112px !important; }
-    [class*="st-key-tile_"] .stButton button p { font-size: 0.82rem; }
+    [class*="st-key-open_"] button { min-height: 112px; padding: 4px 0 !important; }
+    [class*="st-key-open_"] button::before { width: 64px; height: 64px; min-height: 64px; font-size: 34px; border-radius: 18px; }
+    [class*="st-key-open_"] button p { font-size: 0.8rem; }
+    .block-container { padding-top: 2.4rem !important; padding-left: 0.8rem; padding-right: 0.8rem; }
+    .st-key-topbar .stButton button p { display: none; }
+    .topbar img { height: 36px; }
+    .app-name { font-size: 1.05rem; }
     .hello-name { font-size: 1.5rem; }
 }
 
@@ -168,7 +184,7 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 .login-title { font-size: 1.9rem; font-weight: 800; color: #1e1b4b; text-align: center; margin-top: 1rem; }
 .login-sub { color: #6b7280; text-align: center; margin-bottom: 1rem; }
 </style>
-""".replace("LOGO_B64", LOGO_B64)
+""".replace("LOGO_B64", LOGO_B64).replace("TILE_CSS", TILE_CSS)
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -1685,6 +1701,12 @@ def log_out():
 
 
 def top_bar(user, show_home):
+    with st.container(key="topbar"):
+        top_bar_row(user, show_home)
+    st.write("")
+
+
+def top_bar_row(user, show_home):
     c = st.columns([6, 1.2, 1.2])
     team = f' | {user["team"]}' if user.get("team") else ""
     c[0].markdown(
@@ -1696,7 +1718,6 @@ def top_bar(user, show_home):
     if show_home:
         c[1].button("Home", icon=":material/home:", on_click=go, args=("Home",), use_container_width=True)
     c[2].button("Log out", icon=":material/logout:", on_click=log_out, use_container_width=True)
-    st.write("")
 
 
 def arrivals_glimpse():
@@ -1754,15 +1775,7 @@ def home_page(user):
             cols = st.columns(per_row)
             for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
                 slug = key.replace(" ", "_")
-                c1, c2 = TILE_COLORS.get(key, ("#60a5fa", "#1d4ed8"))
-                glyph = icon.replace(":material/", "").strip(":")
-                with col.container(key=f"tile_{slug}"):
-                    st.markdown(
-                        f'<div class="tile"><div class="tile-icon" style="background: linear-gradient(145deg, {c1}, {c2});">'
-                        f'<span class="material-symbols-rounded">{glyph}</span></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.button(title, key=f"open_{slug}", help=text, on_click=go, args=(key,))
+                col.button(title, key=f"open_{slug}", help=text, on_click=go, args=(key,), use_container_width=True)
     arrivals_glimpse()
 
 
