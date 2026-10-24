@@ -92,8 +92,9 @@ html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, sele
     background: url("data:image/png;base64,LOGO_B64") center 55% / min(70vw, 900px) no-repeat;
     opacity: 0.17;
 }
-.block-container { position: relative; z-index: 1; padding-top: 1.2rem; max-width: 1150px; }
+.block-container { position: relative; z-index: 1; padding-top: 1.5rem !important; max-width: 1150px; }
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stSidebarCollapsedControl"] { visibility: hidden; }
+header[data-testid="stHeader"], [data-testid="stDecoration"] { display: none !important; }
 h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 
 /* Glass panels */
@@ -121,13 +122,9 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 .page-head { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px 0; }
 .page-head img { height: 34px; border-radius: 5px; }
 
-/* Icon tiles on the home page: the picture is HTML, an invisible button covers it */
-[class*="st-key-tile_"] { position: relative; }
-[class*="st-key-tile_"] .stButton { position: absolute; inset: 0; z-index: 5; }
-[class*="st-key-tile_"] .stButton button {
-    width: 100%; height: 100%; opacity: 0; cursor: pointer; border: none;
-}
-.tile { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 10px 0 6px 0; }
+/* Icon tiles on the home page. The icon is a picture; the button under it shows the
+   name and is pulled up over the icon so the whole tile is clickable. */
+.tile { display: flex; justify-content: center; padding-top: 10px; pointer-events: none; }
 .tile-icon {
     width: 84px; height: 84px; border-radius: 22px; border: 4px solid #ffffff;
     display: flex; align-items: center; justify-content: center;
@@ -136,7 +133,26 @@ h1, h2, h3 { color: #1e1b4b; font-weight: 700; letter-spacing: -0.01em; }
 }
 .tile-icon .material-symbols-rounded { font-family: 'Material Symbols Rounded'; font-size: 44px; color: #ffffff; line-height: 1; }
 [class*="st-key-tile_"]:hover .tile-icon { transform: translateY(-3px) scale(1.04); }
-.tile-label { font-size: 0.98rem; font-weight: 600; color: #1e1b4b; text-align: center; }
+[class*="st-key-tile_"] .stButton button {
+    width: 100% !important; background: transparent !important; border: none !important; box-shadow: none !important;
+    margin-top: -112px !important; padding-top: 100px !important; min-height: 136px !important;
+    position: relative; z-index: 3; cursor: pointer;
+}
+[class*="st-key-tile_"] .stButton button:focus, [class*="st-key-tile_"] .stButton button:active { outline: none !important; }
+[class*="st-key-tile_"] .stButton button p { font-size: 0.98rem; font-weight: 600; color: #1e1b4b; }
+
+/* Phones: tiles in rows of 3, smaller icons */
+@media (max-width: 640px) {
+    .st-key-tiles [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; flex-direction: row !important; gap: 0.5rem !important; }
+    .st-key-tiles [data-testid="stColumn"], .st-key-tiles [data-testid="column"] {
+        width: calc(33.3% - 0.5rem) !important; flex: 0 0 calc(33.3% - 0.5rem) !important; min-width: calc(33.3% - 0.5rem) !important;
+    }
+    .tile-icon { width: 64px; height: 64px; border-radius: 18px; }
+    .tile-icon .material-symbols-rounded { font-size: 34px; }
+    [class*="st-key-tile_"] .stButton button { margin-top: -90px !important; padding-top: 80px !important; min-height: 112px !important; }
+    [class*="st-key-tile_"] .stButton button p { font-size: 0.82rem; }
+    .hello-name { font-size: 1.5rem; }
+}
 
 .stButton button { border-radius: 12px; font-weight: 500; }
 .stButton button[kind="primary"], .stFormSubmitButton button[kind="primaryFormSubmit"] {
@@ -218,6 +234,12 @@ def init_db():
             status TEXT NOT NULL,
             marked_by TEXT,
             PRIMARY KEY (username, day))"""
+    )
+    run(
+        """CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            expires TEXT NOT NULL)"""
     )
     run(
         """CREATE TABLE IF NOT EXISTS arrivals (
@@ -376,6 +398,50 @@ def login_page():
         login_form()
 
 
+SESSION_HOURS = 8
+
+
+def user_from_row(row):
+    return {
+        "username": row["username"],
+        "name": row["name"],
+        "role": row["role"],
+        "team": row["team"],
+        "must_change": bool(row["must_change"]),
+    }
+
+
+def start_session(username):
+    now = datetime.now(timezone.utc)
+    run("DELETE FROM sessions WHERE expires < :n", n=now.isoformat())
+    token = secrets.token_urlsafe(24)
+    run(
+        "INSERT INTO sessions (token, username, expires) VALUES (:t, :u, :e)",
+        t=token, u=username, e=(now + timedelta(hours=SESSION_HOURS)).isoformat(),
+    )
+    st.query_params["s"] = token
+
+
+def resume_session():
+    """After a refresh, log the user back in from the token in the link if it has not expired."""
+    token = st.query_params.get("s")
+    if not token:
+        return None
+    found = rows(
+        "SELECT u.* FROM sessions s JOIN users u ON u.username = s.username "
+        "WHERE s.token = :t AND s.expires > :n",
+        t=token, n=datetime.now(timezone.utc).isoformat(),
+    )
+    if not found:
+        st.query_params.clear()
+        return None
+    st.session_state.user = user_from_row(found[0])
+    page = st.query_params.get("p")
+    if page:
+        st.session_state.page = page
+    return st.session_state.user
+
+
 def login_form():
     with st.form("login", border=True):
         username = st.text_input("Username").strip().lower()
@@ -383,13 +449,8 @@ def login_form():
         if st.form_submit_button("Log in", type="primary", use_container_width=True):
             found = rows("SELECT * FROM users WHERE lower(username) = :u", u=username)
             if found and check_password(password, found[0]["password_hash"]):
-                st.session_state.user = {
-                    "username": found[0]["username"],
-                    "name": found[0]["name"],
-                    "role": found[0]["role"],
-                    "team": found[0]["team"],
-                    "must_change": bool(found[0]["must_change"]),
-                }
+                st.session_state.user = user_from_row(found[0])
+                start_session(found[0]["username"])
                 st.rerun()
             st.error("Wrong username or password.")
 
@@ -1608,9 +1669,17 @@ PAGES = {
 
 def go(page):
     st.session_state.page = page
+    if page == "Home":
+        st.query_params.pop("p", None)
+    else:
+        st.query_params["p"] = page
 
 
 def log_out():
+    token = st.query_params.get("s")
+    if token:
+        run("DELETE FROM sessions WHERE token = :t", t=token)
+    st.query_params.clear()
     st.session_state.pop("user", None)
     st.session_state.page = "Home"
 
@@ -1680,7 +1749,7 @@ def home_page(user):
     )
     cards = [c for c in CARDS if user["role"] in c[4]]
     per_row = 5
-    with st.container(border=True):
+    with st.container(border=True, key="tiles"):
         for i in range(0, len(cards), per_row):
             cols = st.columns(per_row)
             for col, (key, title, text, icon, _) in zip(cols, cards[i : i + per_row]):
@@ -1690,8 +1759,7 @@ def home_page(user):
                 with col.container(key=f"tile_{slug}"):
                     st.markdown(
                         f'<div class="tile"><div class="tile-icon" style="background: linear-gradient(145deg, {c1}, {c2});">'
-                        f'<span class="material-symbols-rounded">{glyph}</span></div>'
-                        f'<div class="tile-label">{title}</div></div>',
+                        f'<span class="material-symbols-rounded">{glyph}</span></div></div>',
                         unsafe_allow_html=True,
                     )
                     st.button(title, key=f"open_{slug}", help=text, on_click=go, args=(key,))
@@ -1700,7 +1768,7 @@ def home_page(user):
 
 def main():
     init_db()
-    user = st.session_state.get("user")
+    user = st.session_state.get("user") or resume_session()
     if not user:
         login_page()
         return
